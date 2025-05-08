@@ -20,7 +20,7 @@ tasks/
     isotropic_em/
 ```
 
-1. Install Packages
+2. Install Packages
 
 * Python 3.8
 * Pytorch 2.0.1, CUDA 11.7 and CUDNN 
