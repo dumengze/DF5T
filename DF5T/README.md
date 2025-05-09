@@ -4,7 +4,7 @@
 
 
 
-## User Interface for UniFMIR
+## User Interface for DF5T
 
 1. Download the Finetuned Models
 
