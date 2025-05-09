@@ -270,4 +270,4 @@ dependencies:
       - xmltodict==0.13.0
       - yarl==1.9.4
       - zipp==3.17.0
-prefix: D:\anaconda\envs\pytorch-CycleGAN-and-pix2pix
+prefix: D:\anaconda\envs\DF5T
