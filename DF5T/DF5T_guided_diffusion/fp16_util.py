@@ -6,8 +6,6 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-import sys
-sys.path.append('D:/2/ddrm/guided_diffusion')
 from logger import logkv_mean, log
 
 INITIAL_LOG_LOSS_SCALE = 20.0
