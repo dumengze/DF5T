@@ -1,7 +1,7 @@
 # Diffusion-based foundation model for 5 task(DF5T)
  
 ## Online Demo
-
+![](df5t_icon.png)
 
 
 ## User Interface for DF5T
