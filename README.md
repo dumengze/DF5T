@@ -29,7 +29,9 @@ tasks/
 You can install the required python packages by the following command:
 
 ```
-conda env create -f environment.yaml
+conda create -n DF5T python=3.8
+conda activate DF5T
+pip install -r requirements.txt
 ```
 
 3. Run the Web Interface
