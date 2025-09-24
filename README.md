@@ -44,7 +44,10 @@ python app.py
 ```
 
 You can learn how to use the app through https://www.youtube.com/watch?v=2AW3lW8pVhw.
-
+See the instructions in the image below.
+ ![](Step1.tif)
+ ![](Step2.tif)
+ ![](Step3.tif)
 ## Train
 
 
