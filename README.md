@@ -1,8 +1,6 @@
 # Diffusion-based foundation model for 5 task(DF5T)
  ![](df5t_icon.png)
 
-## Online Demo
-https://youtu.be/GrUuY4oedGE.mp4
 
 ## User Interface for DF5T
 
@@ -43,7 +41,7 @@ You can run the interactive software with the following command:
 python app.py
 ```
 
-You can learn how to use the app through https://www.youtube.com/watch?v=2AW3lW8pVhw.
+You can learn how to use the app through https://youtu.be/GrUuY4oedGE.
 See the instructions in the image below.
  ![](Step1.png)
  ![](Step2.png)
