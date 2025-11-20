@@ -13,7 +13,7 @@ from tools import get_dataset, data_transform, inverse_data_transform
 from DF5T_guided_diffusion import dist_util, logger
 from DF5T_guided_diffusion.script_util import create_model
 import torch.nn.functional as F
-
+from typing import List, Tuple
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -397,38 +397,61 @@ class Diffusion(object):
             logger.error(f"Patch cropping error: {str(e)}")
             raise
 
-    def stitch_patches(self, patches, positions, original_size, patch_size, overlap, upscale_ratio=1):
+
+    def stitch_patches(self,
+                    patches: List[torch.Tensor],
+                    positions: List[Tuple[int, int]],
+                    original_size: Tuple[int, int],
+                    patch_size: int,
+                    overlap: int,
+                    upscale_ratio: int = 1) -> torch.Tensor:
         try:
             if not patches:
                 raise ValueError("No patches provided")
-            h, w = original_size
-            h, w = h * upscale_ratio, w * upscale_ratio
-            patch_size = patch_size * upscale_ratio
-            if not patches:
-                logger.warning("No patches provided, returning zero tensor")
-                return torch.zeros(1, patches[0].shape[1], h, w).to(self.device)
-            
-            b = patches[0].shape[0]
-            c = patches[0].shape[1]
-            stitched = torch.zeros(b, c, h, w).to(self.device)
-            count_map = torch.zeros(b, c, h, w).to(self.device)
-            for patch, (y, x) in zip(patches, positions):
-                y, x = y * upscale_ratio, x * upscale_ratio
-                if patch.shape[2] != patch_size or patch.shape[3] != patch_size:
-                    patch = F.interpolate(patch, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
-                y_end = min(y + patch_size, h)
-                x_end = min(x + patch_size, w)
-                patch = patch[:, :, :y_end - y, :x_end - x]
-                stitched[:, :, y:y_end, x:x_end] += patch
-                count_map[:, :, y:y_end, x:x_end] += 1
-            count_map[count_map == 0] = 1
-            stitched = stitched / count_map
-            high_freq = stitched - torch.nn.functional.avg_pool2d(stitched, 3, stride=1, padding=1)
-            stitched = stitched + 0.4 * high_freq
+            B, C, pH, pW = patches[0].shape
+            target_h = patch_size * upscale_ratio
+            target_w = patch_size * upscale_ratio
+            for i, p in enumerate(patches):
+                if p.shape[2:] != (target_h, target_w):
+                    patches[i] = F.interpolate(
+                        p, size=(target_h, target_w),
+                        mode='bilinear', align_corners=False)
+            H = original_size[0] * upscale_ratio
+            W = original_size[1] * upscale_ratio
+            stitched   = torch.zeros(B, C, H, W, device=self.device, dtype=torch.float32)
+            weight_map = torch.zeros(B, C, H, W, device=self.device, dtype=torch.float32)
+            ramp_h = torch.linspace(0, 1, target_h, device=self.device)
+            ramp_w = torch.linspace(0, 1, target_w, device=self.device)
+            ramp_h = torch.min(ramp_h, 1 - ramp_h)
+            ramp_w = torch.min(ramp_w, 1 - ramp_w)
+            ramp = torch.outer(ramp_h, ramp_w).clamp(min=1e-6)
+
+            if overlap * upscale_ratio < 4:
+                ramp = torch.ones_like(ramp)
+            for patch, (y0, x0) in zip(patches, positions):
+                y0 = y0 * upscale_ratio
+                x0 = x0 * upscale_ratio
+                y1 = min(y0 + target_h, H)
+                x1 = min(x0 + target_w, W)
+
+                patch_crop = patch[:, :, :y1 - y0, :x1 - x0]
+                ramp_crop  = ramp[:y1 - y0, :x1 - x0]
+                w = ramp_crop.unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1)
+
+                stitched[:, :, y0:y1, x0:x1]   += patch_crop * w
+                weight_map[:, :, y0:y1, x0:x1] += w
+            weight_map = torch.clamp(weight_map, min=1e-6)
+            stitched = stitched / weight_map
+
+            blurred = F.avg_pool2d(stitched, kernel_size=3, stride=1, padding=1)
+            high_freq = stitched - blurred
+            stitched = stitched + 0.2 * high_freq
             stitched = torch.clamp(stitched, 0.0, 1.0)
-            logger.info(f"Stitched image to size {stitched.shape[2]}x{stitched.shape[3]}")
+
+            logger.info(f"Stitched image size: {stitched.shape[2]}x{stitched.shape[3]}")
             return stitched
-        except ValueError as e:
+
+        except Exception as e:
             logger.error(f"Patch stitching error: {str(e)}")
             raise
 
@@ -477,30 +500,34 @@ class Diffusion(object):
                     original_shape = x_orig.shape
                     batch_size, channels, h, w = x_orig.shape
 
-                    # Detect if input is grayscale content
                     input_is_gray = channels == 1
                     if channels == 3:
                         channel_diff = torch.max(torch.abs(x_orig[:, 0] - x_orig[:, 1]) + torch.abs(x_orig[:, 1] - x_orig[:, 2]))
                         if channel_diff < 1e-5:
                             input_is_gray = True
                             logger.info("Detected 3-channel grayscale image, treating as grayscale")
-                            # Convert to 1 channel for consistency if needed, but keep channels=3 for model
-                    is_grayscale = input_is_gray  # Use this for processing decisions
+                        
+                    is_grayscale = input_is_gray 
 
                     x_orig_padded, original_size, pad_offsets = pad_image(x_orig, min_size=256)
                     block_size = max(x_orig_padded.shape[2], x_orig_padded.shape[3])
                     use_patches = h >= config.data.image_size and w >= config.data.image_size
 
-                    patches, positions, padded_size = self.crop_to_patches(x_orig_padded, config.data.image_size, overlap)
+                    patches, positions, padded_size = self.crop_to_patches(
+                        x_orig_padded, config.data.image_size, overlap
+                    )
                     degraded_patches = []
                     restored_patches = []
                     upscale_ratio = 1
-
-                    if deg == 'isotropic_em':
+                    use_prev = getattr(self.args, "use_prev_img_info", False)
+                    if deg == 'isotropic_em' and use_prev:
                         patches, positions, padded_size = self.process_batch_with_prev_info(
                             self.prev_batch, x_orig_padded, self.config
                         )
-                    self.prev_batch = x_orig_padded.clone()  # Update previous batch data
+                        self.prev_batch = x_orig_padded.clone()
+                    else:
+                        self.prev_batch = None
+
 
                     for patch_idx, patch in enumerate(patches):
                         try:
@@ -528,9 +555,10 @@ class Diffusion(object):
                                 H_funcs = Inpainting(channels, H, missing, self.device)
                             elif deg == 'deno_em':
                                 from tools.EMSVD import EMDenoising
-                                H_funcs = EMDenoising(channels, patch.shape[2], self.device)
+                                H_funcs = EMDenoising(channels, patch.shape[2], self.device, sigma=1.2)
                             elif deg == 'isotropic_em':
                                 from tools.EMSVD import IsotropicEM
+                                use_prev = getattr(self.args, "use_prev_img_info", False)
                                 H_funcs = IsotropicEM(
                                     channels=channels,
                                     img_dim=patch.shape[2],
@@ -539,18 +567,45 @@ class Diffusion(object):
                                     sigma_x=1.0,
                                     sigma_y=1.0,
                                     sigma_z=2.0,
-                                    use_prev_img_info=True
+                                    use_prev_img_info=use_prev
                                 )
+
                             elif deg == 'deblur_em':
-                                from tools.EMSVD import EMDeblurring
-                                sigma = 0.05
-                                pdf = lambda x: torch.exp(torch.tensor([-0.5 * (x / sigma)**2]))
-                                kernel = torch.tensor([pdf(-5), pdf(-4), pdf(-3), pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2), pdf(3), pdf(4), pdf(5)]).to(self.device)
-                                H_funcs = EMDeblurring(kernel / kernel.sum(), channels, patch.shape[2], self.device)
+                                from tools.EMSVD import EMDeblurring, make_ctf_kernel_1d
+                                pixel_size = getattr(self.args, "pixel_size", 1.5)            # Å
+                                lam = getattr(self.args, "electron_wavelength", 0.0197)      # Å
+                                defocus = getattr(self.args, "defocus", -15000.0)            # Å
+                                Cs = getattr(self.args, "Cs", 2.7e7)                         # Å
+                                amp_contrast = getattr(self.args, "amplitude_contrast", 0.07)
+                                bfactor = getattr(self.args, "bfactor", 0.0)
+                                ctf_kernel_size = getattr(self.args, "ctf_kernel_size", 11)
+
+                                kernel = make_ctf_kernel_1d(
+                                    img_dim=patch.shape[2],
+                                    kernel_size=ctf_kernel_size,
+                                    pixel_size=pixel_size,
+                                    lam=lam,
+                                    defocus=defocus,
+                                    Cs=Cs,
+                                    amp_contrast=amp_contrast,
+                                    bfactor=bfactor,
+                                    device=self.device,
+                                )
+
+                                deblur_alpha = getattr(self.args, "deblur_alpha", 1e-3)
+                                H_funcs = EMDeblurring(
+                                    kernel,
+                                    channels,
+                                    patch.shape[2],
+                                    self.device,
+                                    sigma=sigma_0,
+                                    alpha=deblur_alpha,
+                                )
+
                             elif deg[:2] == 'sr':
                                 blur_by = int(deg[2:])
                                 from tools.EMSVD import SuperResolutionEM
-                                H_funcs = SuperResolutionEM(channels, patch.shape[2], blur_by, self.device, sigma_0=sigma_0, gaussian_sigma=0.8)
+                                H_funcs = SuperResolutionEM(channels, patch.shape[2], blur_by, self.device, gaussian_sigma=0.8)
                                 upscale_ratio = blur_by
                             else:
                                 logger.error(f"Unsupported degradation type: {deg}")
@@ -744,7 +799,7 @@ class Diffusion(object):
                 model = create_model(**config_dict)
                 if self.config.model.use_fp16:
                     model.convert_to_fp16()
-                model_path = "exp/model/MitEM/model_256.pt"
+                model_path = r"C:\Users\du\Desktop\model_2562.pt"
                 model.load_state_dict(dist_util.load_state_dict(model_path, map_location="cuda"))
                 model.to(self.device)
                 model.eval()
