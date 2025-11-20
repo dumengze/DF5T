@@ -4,12 +4,11 @@ from torchvision.models import vgg16, VGG16_Weights
 from skimage.metrics import structural_similarity as skimage_ssim
 import numpy as np
 
+def _safe_sort_desc(tensor):
+    vals, idx = torch.sort(tensor, descending=True)
+    return vals, idx
+
 class H_functions:
-    """
-    A class replacing the SVD of a matrix H, perhaps efficiently.
-    All input vectors are of shape (Batch, ...).
-    All output vectors are of shape (Batch, DataDimension).
-    """
     def V(self, vec):
         raise NotImplementedError()
 
@@ -182,80 +181,229 @@ class Inpainting(H_functions):
         return result * self.mask.unsqueeze(0)
 
 class EMDenoising(H_functions):
-    def __init__(self, channels, img_dim, device, alpha=0.7, beta=0.2, sigma=0.05):
+    def __init__(self, channels, img_dim, device, sigma=1.2, attenuation_factor=0.0, diffusion_factor=0.0, diffusion_alpha=1.0):
         self.channels = channels
         self.img_dim = img_dim
         self.device = device
-        self.alpha = alpha
-        self.beta = beta
-        self.sigma = sigma
-        total_pixels = channels * img_dim**2
-        self._singulars = torch.linspace(1.0, 0.5, total_pixels, device=device)
+        self.sigma = float(sigma)
+        self.attenuation_factor = float(attenuation_factor)
+        self.diffusion_factor = float(diffusion_factor)
 
-    def _diffusion(self, x):
-        return x * (1 + self.alpha)
+        size = max(3, int(8 * self.sigma + 1))
+        if size % 2 == 0:
+            size += 1
+        x = torch.arange(size, dtype=torch.float32, device=self.device) - size // 2
+        kernel_1d = torch.exp(-0.5 * (x / self.sigma)**2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
 
-    def _frequency_attenuation(self, x):
-        x_freq = torch.fft.fft2(x)
-        attenuation = torch.linspace(0, 1, self.img_dim, device=self.device)
-        attenuation = attenuation.view(1, 1, self.img_dim, 1).expand(-1, -1, self.img_dim, self.img_dim)
-        x_freq_attenuated = x_freq * (1 - self.beta * attenuation)
-        return torch.fft.ifft2(x_freq_attenuated).real
+        Hx = self._build_1d_matrix(kernel_1d, img_dim).to(self.device)
+        Hy = self._build_1d_matrix(kernel_1d, img_dim).to(self.device)
 
-    def _add_noise(self, x):
-        poisson_noise = torch.poisson(x.abs()) * x.sign()
-        gaussian_noise = torch.randn_like(x) * self.sigma
-        return poisson_noise + gaussian_noise
+        try:
+            Ux, Sx, Vx = torch.svd(Hx, some=False)
+            Uy, Sy, Vy = torch.svd(Hy, some=False)
+        except Exception:
+            Ux, Sx, Vx = torch.linalg.svd(Hx, full_matrices=False)
+            Uy, Sy, Vy = torch.linalg.svd(Hy, full_matrices=False)
 
-    def V(self, vec):
-        return vec.reshape(vec.shape[0], -1)
+        self.Ux, self.Sx, self.Vx = Ux, Sx, Vx
+        self.Uy, self.Sy, self.Vy = Uy, Sy, Vy
 
-    def Vt(self, vec):
-        return vec.reshape(vec.shape[0], -1)
+        sing = torch.outer(self.Sx, self.Sy).flatten()
+        sing_sorted, _ = _safe_sort_desc(sing)
+        N = sing_sorted.shape[0]
+        idx = torch.arange(N, dtype=torch.float32, device=self.device)
+        linear_decay = idx / max(1.0, (N - 1))
+        beta = self.diffusion_factor
+        alpha = self.attenuation_factor
+        adjusted = sing_sorted * (1.0 - alpha * linear_decay.clamp(0.0, 1.0)) * torch.exp(-beta * linear_decay)
+        adjusted = torch.clamp(adjusted, min=0.0)
+        adjusted[adjusted < 1e-12] = 0.0
+        self._singulars = adjusted.repeat(self.channels)
 
-    def U(self, vec):
-        diffused = self._diffusion(vec)
-        return diffused.reshape(vec.shape[0], -1)
+        self.Hx = Hx
+        self.Hy = Hy
+        self._vec_len = self.channels * img_dim * img_dim
+        self.mask = torch.ones(self.channels * img_dim * img_dim, device=self.device)
+        self.diffusion_alpha = diffusion_alpha
 
-    def Ut(self, vec):
-        restored = vec / (1 + self.alpha)
-        return restored.reshape(vec.shape[0], -1)
+    def _build_1d_matrix(self, kernel, dim):
+        pad = kernel.shape[0] // 2
+        H = torch.zeros(dim, dim, device=self.device)
+        for i in range(dim):
+            for k in range(-pad, pad + 1):
+                j = i + k
+                if 0 <= j < dim:
+                    H[i, j] = kernel[k + pad]
+        return H
 
     def singulars(self):
-        return self._singulars * (1 - self.beta)
+        return self._singulars
 
-    def add_zeros(self, vec):
-        return vec.reshape(vec.shape[0], -1)
+    def U(self, vec):
+        bsz = vec.shape[0]
+        vec_4d = vec.view(bsz, self.channels, self.img_dim, self.img_dim)
+        merged = vec_4d.reshape(bsz * self.channels, self.img_dim, self.img_dim)
+        temp = torch.matmul(merged, self.Ux.T)
+        out = torch.matmul(self.Uy, temp)
+        out = out.view(bsz, self.channels, self.img_dim, self.img_dim)
+        return out.view(bsz, -1)
+
+    def Ut(self, vec):
+        bsz = vec.shape[0]
+        vec_4d = vec.view(bsz, self.channels, self.img_dim, self.img_dim)
+        merged = vec_4d.reshape(bsz * self.channels, self.img_dim, self.img_dim)
+        temp = torch.matmul(self.Uy.T, merged)
+        out = torch.matmul(temp, self.Ux)
+        out = out.view(bsz, self.channels, self.img_dim, self.img_dim)
+        return out.view(bsz, -1)
+
+    def V(self, vec):
+        bsz = vec.shape[0]
+        vec_4d = vec.view(bsz, self.channels, self.img_dim, self.img_dim)
+        merged = vec_4d.reshape(bsz * self.channels, self.img_dim, self.img_dim)
+        temp = torch.matmul(merged, self.Vx.T)
+        out = torch.matmul(self.Vy, temp)
+        out = out.view(bsz, self.channels, self.img_dim, self.img_dim)
+        return out.view(bsz, -1)
+
+    def Vt(self, vec):
+        bsz = vec.shape[0]
+        vec_4d = vec.view(bsz, self.channels, self.img_dim, self.img_dim)
+        merged = vec_4d.reshape(bsz * self.channels, self.img_dim, self.img_dim)
+        temp = torch.matmul(self.Vy.T, merged)
+        out = torch.matmul(temp, self.Vx)
+        out = out.view(bsz, self.channels, self.img_dim, self.img_dim)
+        return out.view(bsz, -1)
+
+    def H(self, vec):
+        bsz = vec.shape[0]
+        v = self.Vt(vec)
+        s = self.singulars()
+        s = s.to(v.device)
+        if v.shape[1] != s.shape[0]:
+            minlen = min(v.shape[1], s.shape[0])
+            v = v[:, :minlen]
+            s = s[:minlen]
+        out = v * s.view(1, -1)
+        out = self.U(out)
+        return out
+
+    def H_pinv(self, vec, reg: float = 1e-6):
+        ut = self.Ut(vec)
+        s = self.singulars().to(ut.device)
+        denom = s.clone() * self.diffusion_alpha
+        denom = denom + reg
+        nonzero = denom > 0
+        res = torch.zeros_like(ut)
+        if nonzero.any():
+            used = nonzero.nonzero(as_tuple=False).view(-1)
+            res[:, used] = ut[:, used] / denom[used].view(1, -1)
+        out = self.V(res)
+        out = out * self.mask.unsqueeze(0)
+        return out
+
+def make_ctf_kernel_1d(
+    img_dim: int,
+    kernel_size: int,
+    pixel_size: float,
+    lam: float = 0.0197,
+    defocus: float = -15000.0,
+    Cs: float = 2.7e7,
+    amp_contrast: float = 0.07,
+    phase_shift: float = 0.0,
+    bfactor: float = 0.0,
+    device=None,
+) -> torch.Tensor:
+    if device is None:
+        device = torch.device("cpu")
+
+    freq = torch.fft.fftfreq(img_dim, d=pixel_size, device=device)
+    k2 = freq ** 2
+    k4 = k2 ** 2
+
+    pi = torch.pi
+    lam_t = torch.tensor(lam, device=device, dtype=torch.float32)
+    defocus_t = torch.tensor(defocus, device=device, dtype=torch.float32)
+    Cs_t = torch.tensor(Cs, device=device, dtype=torch.float32)
+
+    chi = pi * lam_t * defocus_t * k2 - 0.5 * pi * Cs_t * (lam_t ** 3) * k4 + phase_shift
+
+    amp = torch.tensor(amp_contrast, device=device, dtype=torch.float32)
+    ctf = -(
+        torch.sqrt(1.0 - amp ** 2) * torch.sin(chi)
+        + amp * torch.cos(chi)
+    )
+
+    if bfactor > 0.0:
+        ctf = ctf * torch.exp(-(bfactor * k2) / 4.0)
+
+    psf = torch.fft.ifft(ctf).real
+    psf = torch.fft.fftshift(psf)
+
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    mid = img_dim // 2
+    half = kernel_size // 2
+    start = max(0, mid - half)
+    end = min(img_dim, mid + half + 1)
+    kernel = psf[start:end]
+
+    if kernel.shape[0] < kernel_size:
+        pad_left = half - (mid - start)
+        pad_right = half - (end - mid - 1)
+        kernel = F.pad(kernel, (pad_left, pad_right))
+
+    kernel = kernel / kernel.abs().sum().clamp_min(1e-12)
+    return kernel.to(device)
 
 class EMDeblurring(H_functions):
     def mat_by_img(self, M, v):
         batch_size = v.shape[0]
-        return torch.matmul(M, v.reshape(batch_size * self.channels, self.img_dim, self.img_dim)).reshape(batch_size, self.channels, M.shape[0], self.img_dim)
+        return torch.matmul(
+            M,
+            v.reshape(batch_size * self.channels, self.img_dim, self.img_dim)
+        ).reshape(batch_size, self.channels, M.shape[0], self.img_dim)
 
     def img_by_mat(self, v, M):
         batch_size = v.shape[0]
-        return torch.matmul(v.reshape(batch_size * self.channels, self.img_dim, self.img_dim), M).reshape(batch_size, self.channels, self.img_dim, M.shape[1])
+        return torch.matmul(
+            v.reshape(batch_size * self.channels, self.img_dim, self.img_dim),
+            M
+        ).reshape(batch_size, self.channels, self.img_dim, M.shape[1])
 
-    def __init__(self, kernel, channels, img_dim, device, sigma=1.0, alpha=1e-3):
+    def __init__(self, kernel: torch.Tensor, channels: int, img_dim: int,
+                 device, sigma: float = 1.0, alpha: float = 1e-3):
         self.img_dim = img_dim
         self.channels = channels
         self.device = device
-        self.alpha = alpha
-        self.sigma = sigma
+        self.alpha = float(alpha)
+        self.sigma = float(sigma)
+
+        kernel = kernel.to(device).clone()
+        kernel = kernel / kernel.sum().clamp_min(1e-12)
+
         H_small = torch.zeros(img_dim, img_dim, device=device)
-        kernel = kernel / kernel.sum()
+        k_half = kernel.shape[0] // 2
         for i in range(img_dim):
-            for j in range(i - kernel.shape[0]//2, i + kernel.shape[0]//2 + 1):
-                if j < 0 or j >= img_dim: continue
-                H_small[i, j] = kernel[j - i + kernel.shape[0]//2]
-        self.U_small, self.singulars_small, self.V_small = torch.svd(H_small, some=False)
-        self.singulars_small[self.singulars_small < 1e-10] = 0
-        self._singulars = torch.outer(self.singulars_small, self.singulars_small).reshape(img_dim**2)
-        self._singulars, self._perm = self._singulars.sort(descending=True)
+            for j in range(i - k_half, i + k_half + 1):
+                if 0 <= j < img_dim:
+                    H_small[i, j] = kernel[j - i + k_half]
+
+        U_small, s_small, V_small = torch.svd(H_small, some=False)
+        s_small[s_small < 1e-10] = 0
+
+        self.U_small = U_small
+        self.V_small = V_small
+        self.singulars_small = s_small
+
+        sing2d = torch.outer(s_small, s_small).reshape(img_dim ** 2)
+        self._singulars, self._perm = sing2d.sort(descending=True)
 
     def V(self, vec):
-        temp = torch.zeros(vec.shape[0], self.img_dim**2, self.channels, device=vec.device)
-        temp[:, self._perm, :] = vec.clone().reshape(vec.shape[0], self.img_dim**2, self.channels)
+        temp = torch.zeros(vec.shape[0], self.img_dim ** 2, self.channels, device=vec.device)
+        temp[:, self._perm, :] = vec.clone().reshape(vec.shape[0], self.img_dim ** 2, self.channels)
         temp = temp.permute(0, 2, 1)
         out = self.mat_by_img(self.V_small, temp)
         out = self.img_by_mat(out, self.V_small.transpose(0, 1)).reshape(vec.shape[0], -1)
@@ -268,8 +416,8 @@ class EMDeblurring(H_functions):
         return temp.reshape(vec.shape[0], -1)
 
     def U(self, vec):
-        temp = torch.zeros(vec.shape[0], self.img_dim**2, self.channels, device=vec.device)
-        temp[:, self._perm, :] = vec.clone().reshape(vec.shape[0], self.img_dim**2, self.channels)
+        temp = torch.zeros(vec.shape[0], self.img_dim ** 2, self.channels, device=vec.device)
+        temp[:, self._perm, :] = vec.clone().reshape(vec.shape[0], self.img_dim ** 2, self.channels)
         temp = temp.permute(0, 2, 1)
         out = self.mat_by_img(self.U_small, temp)
         out = self.img_by_mat(out, self.U_small.transpose(0, 1)).reshape(vec.shape[0], -1)
@@ -284,7 +432,7 @@ class EMDeblurring(H_functions):
     def H_pinv(self, vec):
         temp = self.Ut(vec)
         singulars = self.singulars()
-        denom = singulars**2 + self.alpha * (self.sigma**2)
+        denom = singulars ** 2 + self.alpha * (self.sigma ** 2)
         mask = (singulars > 1e-10)
         temp = temp * (singulars / denom * mask).unsqueeze(0)
         return self.V(temp)
@@ -296,16 +444,32 @@ class EMDeblurring(H_functions):
         return vec.clone().reshape(vec.shape[0], -1)
 
 class SuperResolutionEM(H_functions):
-    def __init__(self, channels, img_dim, ratio, device):
+    def __init__(self, channels, img_dim, ratio, device, gaussian_sigma=0.8):  
         assert img_dim % ratio == 0
         self.img_dim = img_dim
         self.channels = channels
         self.y_dim = img_dim // ratio
         self.ratio = ratio
         self.device = device
+        self.gaussian_sigma = gaussian_sigma 
+        self.gaussian_kernel = self._create_gaussian_kernel(5, gaussian_sigma).to(device) 
+
         H = torch.tensor([[1 / ratio**2] * ratio**2], device=device)
         self.U_small, self.singulars_small, self.V_small = torch.svd(H, some=False)
         self.Vt_small = self.V_small.transpose(0, 1)
+
+    def _create_gaussian_kernel(self, size, sigma):
+        k = torch.arange(-size // 2 + 1, size // 2 + 1, device=self.device)
+        x, y = torch.meshgrid(k, k, indexing='ij')
+        kernel = torch.exp(-(x**2 + y**2) / (2 * sigma**2))
+        kernel = kernel / kernel.sum()
+        return kernel.view(1, 1, size, size).repeat(self.channels, 1, 1, 1) 
+
+    def H(self, vec):
+        img = vec.view(-1, self.channels, self.img_dim, self.img_dim)
+        blurred = F.conv2d(img, self.gaussian_kernel, padding=2, groups=self.channels) 
+        blurred = blurred.view(vec.shape[0], -1)
+        return super().H(blurred) 
 
     def V(self, vec):
         temp = vec.clone().reshape(vec.shape[0], -1)
@@ -350,7 +514,6 @@ class SuperResolutionEM(H_functions):
 
 class IsotropicEM(H_functions):
     def __init__(self, channels, img_dim, device, kernel_size=3, sigma_x=1.0, sigma_y=1.0, sigma_z=2.0, rank=32, use_prev_img_info=True, similarity_weight=0.1, feature_guidance_weight=0.1):
-        super().__init__()
         self.channels = channels
         self.img_dim = img_dim
         self.device = device
@@ -385,10 +548,7 @@ class IsotropicEM(H_functions):
             param.requires_grad = False
 
     def process(self, patch):
-        try:
-            return patch
-        except Exception as e:
-            raise
+        return patch
 
     def process_with_prev_info(self, prev_img_info, current_img_info):
         curr_min = current_img_info.min()
