@@ -128,13 +128,13 @@ def resize_image_if_needed(image_path: str) -> Tuple[np.ndarray, float, Tuple[in
         
         # Check if resizing is needed
         if original_width > 2048 or original_height > 2048:
-            scale_factor = 0.4
+            scale_factor = 1
             new_width = int(original_width * scale_factor)
             new_height = int(original_height * scale_factor)
             img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
             logger.info(f"Resized image from {original_width}x{original_height} to {new_width}x{new_height} (scale: 1/4)")
         elif original_width > 1024 or original_height > 1024:
-            scale_factor = 0.7
+            scale_factor = 1
             new_width = int(original_width * scale_factor)
             new_height = int(original_height * scale_factor)
             img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
