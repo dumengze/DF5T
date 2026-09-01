@@ -39,3 +39,52 @@ diffusion:
 sampling:
     batch_size: 1
     last_only: True
+
+phase1_weak_detail:
+    enabled: true
+    weak_map:
+        hf_weight: 0.34
+        coherence_weight: 0.20
+        ridge_weight: 0.22
+        support_weight: 0.24
+    agreement:
+        floor: 0.18
+        sharpness: 3.2
+    nonlinear_budget:
+        deblur_em:
+            global: 0.09
+            local: 0.16
+        inp_em:
+            global: 0.07
+            local: 0.14
+    inpaint_short_range:
+        max_hops: 3
+        max_direction_change: 35
+        max_connect_distance_px: 5
+    deblur_thin_membrane:
+        preserve_boost: 0.40
+        dc_relax: 0.75
+    adaptive_postprocess_suppression:
+        enabled: true
+        weak_scene_p95_ref: 0.085
+    detail_survival:
+        deblur_floor: 0.78
+        inpaint_floor: 0.80
+
+phase2_weak_detail:
+    enabled: true
+    tasks:
+        deno_em:
+            nonlinear_budget_global: 0.08
+            nonlinear_budget_local: 0.14
+            survival_floor: 0.76
+        isotropic_em:
+            nonlinear_budget_global: 0.09
+            nonlinear_budget_local: 0.15
+            survival_floor: 0.77
+        sr:
+            nonlinear_budget_global: 0.09
+            nonlinear_budget_local: 0.16
+            survival_floor: 0.75
+    postprocess:
+        adaptive_suppression: true

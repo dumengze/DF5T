@@ -2,9 +2,13 @@ import io
 import os
 import socket
 
-import blobfile as bf
+try:
+    import blobfile as bf
+except Exception:
+    bf = None
 import torch as th
 import torch.distributed as dist
+
 
 def setup_dist():
     """
@@ -34,7 +38,17 @@ def dev():
 def load_state_dict(path, **kwargs):
     """
     Load a PyTorch file.
+
+    On Windows, absolute paths like 'C:\\Users\\...' can cause blobfile to
+    raise 'Unrecognized path'. For local files we bypass blobfile entirely.
     """
+    # Prefer native torch.load for local filesystem paths
+    if os.path.isfile(path):
+        return th.load(path, **kwargs)
+
+    # Fallback to blobfile for remote URLs (gs://, s3://, etc.)
+    if bf is None:
+        raise FileNotFoundError(f"Unable to load model path without blobfile support: {path}")
     with bf.BlobFile(path, "rb") as f:
         data = f.read()
     return th.load(io.BytesIO(data), **kwargs)

@@ -29,12 +29,27 @@ def space_timesteps(num_timesteps, section_counts):
     if isinstance(section_counts, str):
         if section_counts.startswith("ddim"):
             desired_count = int(section_counts[len("ddim") :])
+            if desired_count < 1:
+                raise ValueError(f"invalid ddim step count {desired_count}")
+            if desired_count > num_timesteps:
+                raise ValueError(
+                    f"cannot take {desired_count} steps from {num_timesteps} diffusion timesteps"
+                )
+            # Classic DDIM-style uniform stride when an integer step size hits exactly.
             for i in range(1, num_timesteps):
                 if len(range(0, num_timesteps, i)) == desired_count:
                     return set(range(0, num_timesteps, i))
-            raise ValueError(
-                f"cannot create exactly {num_timesteps} steps with an integer stride"
-            )
+            # Many (num_timesteps, N) pairs have no such stride (e.g. 1500 steps with N=48).
+            # Fall back to ~uniform indices over [0, num_timesteps - 1], same scheme as below.
+            if desired_count == 1:
+                return {0}
+            frac_stride = (num_timesteps - 1) / (desired_count - 1)
+            cur_idx = 0.0
+            taken_steps = []
+            for _ in range(desired_count):
+                taken_steps.append(round(cur_idx))
+                cur_idx += frac_stride
+            return set(taken_steps)
         section_counts = [int(x) for x in section_counts.split(",")]
     size_per = num_timesteps // len(section_counts)
     extra = num_timesteps % len(section_counts)

@@ -53,7 +53,7 @@ def parse_args_and_config():
     parser.add_argument("--config", type=str, required=True, help="Path to the config file")
     parser.add_argument("--doc", type=str, required=True, help="Name of the log folder")
     parser.add_argument("--deg", type=str, required=True, help="Degradation type")
-    parser.add_argument("--sigma_0", type=float, default=0.01, help="Sigma_0 value")  # Reduced default from unspecified to 0.01
+    parser.add_argument("--sigma_0", type=float, default=0.20, help="Processing degree (0.01-1.0): larger = stronger degradation and enhancement")
     
     # Optional arguments with defaults
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")

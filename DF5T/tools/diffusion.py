@@ -1,904 +1,1046 @@
+from __future__ import annotations
+
+import json
 import os
-import logging
-import numpy as np
-import tqdm
-import torch
-import torch.utils.data as data
-import torchvision.utils as tvu
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import cv2
-from skimage.metrics import structural_similarity as skimage_ssim
-import lpips
-import random
-from tools import get_dataset, data_transform, inverse_data_transform
-from DF5T_guided_diffusion import dist_util, logger
-from DF5T_guided_diffusion.script_util import create_model
-import torch.nn.functional as F
-from typing import List, Tuple
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('diffusion.log'),
-        logging.StreamHandler()
-    ]
+import numpy as np
+import torch
+
+from DF5T_guided_diffusion.dist_util import load_state_dict
+from DF5T_guided_diffusion.gaussian_diffusion import _extract_into_tensor
+from DF5T_guided_diffusion.script_util import create_model_and_diffusion
+from tools.EMSVD import (
+    EMTaskOperator,
+    adaptive_fused_linear_restore,
+    direct_em_physics_restore,
+    make_operator,
+    process_em_patch,
+    run_adaptive_chain,
 )
-logger = logging.getLogger(__name__)
+from tools.em_adaptive import build_adaptive_plan
+from tools.em_guided_torch import diffusion_start_ratio, em_guided_prediction
+from tools.em_tensor import clip01, gray01_to_tensor, gray01_to_three_m11, norm01, tensor_to_gray01
+from tools.em_volume_io import save_z_stack_tiff
 
-def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_timesteps):
-    def sigmoid(x):
-        return 1 / (np.exp(-x) + 1)
+_BACKBONE_CACHE: Dict[str, Tuple[torch.nn.Module, Any, Dict[str, Any]]] = {}
+EPS = 1e-6
 
-    if beta_schedule == "quad":
-        betas = (
-            np.linspace(
-                beta_start ** 0.5,
-                beta_end ** 0.5,
-                num_diffusion_timesteps,
-                dtype=np.float64,
-            )
-            ** 2
-        )
-    elif beta_schedule == "linear":
-        betas = np.linspace(
-            beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64
-        )
-    elif beta_schedule == "const":
-        betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
-    elif beta_schedule == "jsd":
-        betas = 1.0 / np.linspace(
-            num_diffusion_timesteps, 1, num_diffusion_timesteps, dtype=np.float64
-        )
-    elif beta_schedule == "sigmoid":
-        betas = np.linspace(-6, 6, num_diffusion_timesteps)
-        betas = sigmoid(betas) * (beta_end - beta_start) + beta_start
-    else:
-        raise NotImplementedError(f"Unsupported beta schedule: {beta_schedule}")
-    assert betas.shape == (num_diffusion_timesteps,)
-    return betas
 
-def enhance_contrast(image, is_grayscale=False):
-    try:
-        if image.dtype != np.uint8:
-            image = (image * 255).clip(0, 255).astype(np.uint8)
-        if is_grayscale:
-            if len(image.shape) == 3 and image.shape[2] == 1:
-                image = image.squeeze(2)
-            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
-            return clahe.apply(image)
+def _save_stage(path: Path, arr: np.ndarray, color_hint: Optional[np.ndarray]):
+    out = arr if arr.ndim == 3 else _gray_to_style(arr.astype(np.uint8), color_hint)
+    cv2.imwrite(str(path), out)
+
+
+# -----------------------------------------------------------------------------
+# Config / path helpers
+# -----------------------------------------------------------------------------
+
+def _cfgv(cfg: Any, *keys: str, default: Any = None) -> Any:
+    cur = cfg
+    for key in keys:
+        if cur is None:
+            return default
+        if isinstance(cur, dict):
+            cur = cur.get(key, None)
         else:
-            lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
-            l = clahe.apply(l)
-            lab = cv2.merge((l, a, b))
-            return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-    except ValueError as e:
-        logger.error(f"Contrast enhancement error: {str(e)}")
-        raise
+            cur = getattr(cur, key, None)
+    return default if cur is None else cur
 
-def preprocess_image(image, target_size=None, is_grayscale=False):
-    try:
-        if image.size == 0:
-            raise ValueError("Input image is empty")
-        if is_grayscale and len(image.shape) == 3 and image.shape[2] == 3:
-            image = np.mean(image, axis=2)
-        if target_size is not None:
-            if not isinstance(target_size, (int, tuple)) or (isinstance(target_size, int) and target_size <= 0):
-                raise ValueError(f"Invalid target_size: {target_size}")
-            image = cv2.resize(image, (target_size, target_size), interpolation=cv2.INTER_AREA)
-        
-        # Enhance contrast
-        enhanced = enhance_contrast(image, is_grayscale=is_grayscale)
-        
-        # Edge detection
-        gray = enhanced if is_grayscale else cv2.cvtColor(enhanced, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 10, 250)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
-        adaptive_thresh = cv2.adaptiveThreshold(closed, 255,
-                                               cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-        
-        # Generate membrane mask
-        n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(adaptive_thresh)
-        valid_regions = [i for i in range(1, n_labels)
-                         if stats[i][cv2.CC_STAT_AREA] > 1
-                         and stats[i][cv2.CC_STAT_AREA] < 100
-                         and stats[i][cv2.CC_STAT_WIDTH] < gray.shape[1] * 0.8
-                         and stats[i][cv2.CC_STAT_HEIGHT] < gray.shape[0] * 0.8]
-        if len(valid_regions) == 0:
-            logger.warning("No valid regions found in preprocessed image, using empty mask")
-            membrane_mask = np.zeros_like(gray)
-        else:
-            membrane_mask = np.isin(labels, valid_regions).astype(np.uint8) * 255
-            membrane_mask = cv2.erode(membrane_mask, kernel, iterations=1)
-        
-        # Edge enhancement
-        edges = cv2.Canny(gray, 50, 150)
-        edges = cv2.dilate(edges, kernel, iterations=1)
-        if is_grayscale:
-            enhanced = cv2.addWeighted(enhanced, 1.0, edges, 0.5, 0)
-        else:
-            enhanced_output = enhanced.copy()
-            for c in range(3):
-                enhanced_output[:, :, c] = cv2.addWeighted(enhanced[:, :, c], 1.0, edges, 0.5, 0)
-            enhanced = enhanced_output
-        
-        return enhanced, membrane_mask
-    except ValueError as e:
-        logger.error(f"Image preprocessing error: {str(e)}")
-        raise
 
-def pad_image(image, min_size=256):
-    try:
-        if not isinstance(image, torch.Tensor) or len(image.shape) != 4:
-            raise ValueError("Input image must be a 4D torch tensor")
-        b, c, h, w = image.shape
-        if h >= min_size and w >= min_size:
-            return image, (h, w), (0, 0)
-        
-        new_h = max(h, min_size)
-        new_w = max(w, min_size)
-        padded = torch.zeros(b, c, new_h, new_w, device=image.device)
-        pad_h = (new_h - h) // 2
-        pad_w = (new_w - w) // 2
-        padded[:, :, pad_h:pad_h+h, pad_w:pad_w+w] = image
-        logger.info(f"Image padded from {h}x{w} to {new_h}x{new_w}")
-        return padded, (h, w), (pad_h, pad_w)
-    except ValueError as e:
-        logger.error(f"Image padding error: {str(e)}")
-        raise
 
-def crop_image(image, original_size, pad_offsets, upscale_ratio=1):
-    try:
-        if not isinstance(image, torch.Tensor) or len(image.shape) != 4:
-            raise ValueError("Input image must be a 4D torch tensor")
-        h, w = original_size
-        pad_h, pad_w = pad_offsets
-        h, w = h * upscale_ratio, w * upscale_ratio
-        _, _, new_h, new_w = image.shape
-        y_start = pad_h * upscale_ratio
-        y_end = y_start + h
-        x_start = pad_w * upscale_ratio
-        x_end = x_start + w
-        if y_end > new_h or x_end > new_w:
-            logger.warning(f"Crop size {y_end}x{x_end} exceeds image size {new_h}x{new_w}, adjusting")
-            y_end = min(y_end, new_h)
-            x_end = min(x_end, new_w)
-        cropped = image[:, :, y_start:y_end, x_start:x_end]
-        logger.info(f"Image cropped from {new_h}x{new_w} to {cropped.shape[2]}x{cropped.shape[3]}")
-        return cropped
-    except ValueError as e:
-        logger.error(f"Image cropping error: {str(e)}")
-        raise
+def _resolve_model_path(explicit: Optional[str], repo_root: Path) -> Path:
+    candidates: List[Path] = []
+    if explicit:
+        p = Path(explicit)
+        candidates.extend([p, repo_root / explicit])
+    candidates.extend([
+        repo_root / "model_2562.pt",
+        repo_root / "exp" / "model" / "MitEM" / "model_2562.pt",
+        repo_root / "exp" / "model" / "MitEM" / "model_y.pt",
+        Path.cwd() / "model_2562.pt",
+        Path.cwd() / "exp" / "model" / "MitEM" / "model_2562.pt",
+    ])
+    seen: List[Path] = []
+    for c in candidates:
+        if c not in seen:
+            seen.append(c)
+        if c.is_file():
+            return c.resolve()
+    for pattern in ("model_2562.pt", "model_y.pt"):
+        for found in repo_root.rglob(pattern):
+            if found.is_file():
+                return found.resolve()
+    raise FileNotFoundError(
+        "Base diffusion model was not found. Expected model_2562.pt. Searched: "
+        + "; ".join(str(p) for p in seen)
+    )
 
-def sharpen_edges(image, alpha=2.0, beta=-1.0, is_grayscale=False):
-    try:
-        if image.dtype != np.uint8:
-            image = (image * 255).clip(0, 255).astype(np.uint8)
-        if is_grayscale:
-            if len(image.shape) == 3 and image.shape[2] == 1:
-                image = image.squeeze(2)
-            blurred = cv2.GaussianBlur(image, (5, 5), 0)
-            sharpened = cv2.addWeighted(image, alpha, blurred, beta, 0)
-        else:
-            hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-            h, s, v = cv2.split(hsv)
-            v_blurred = cv2.GaussianBlur(v, (5, 5), 0)
-            v_sharpened = cv2.addWeighted(v, alpha, v_blurred, beta, 0)
-            hsv_sharpened = cv2.merge((h, s, v_sharpened))
-            sharpened = cv2.cvtColor(hsv_sharpened, cv2.COLOR_HSV2RGB)
-        return np.clip(sharpened, 0, 255).astype(np.uint8)
-    except ValueError as e:
-        logger.error(f"Edge sharpening error: {str(e)}")
-        raise
 
-class Diffusion(object):
-    def __init__(self, args, config, device=None):
+
+def _clean_state_dict(state: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(state, dict):
+        for key in ("state_dict", "model", "ema", "weights"):
+            if key in state and isinstance(state[key], dict):
+                state = state[key]
+                break
+    cleaned: Dict[str, Any] = {}
+    for k, v in state.items():
+        nk = k
+        if nk.startswith("module."):
+            nk = nk[7:]
+        cleaned[nk] = v
+    return cleaned
+
+
+# -----------------------------------------------------------------------------
+# Diffusion backbone: real model-driven nonlinear reverse process
+# -----------------------------------------------------------------------------
+
+class EMGenerativeBackbone:
+    def __init__(self, args: Any, config: Any, device: torch.device):
         self.args = args
         self.config = config
-        if device is None:
-            device = (
-                torch.device("cuda")
-                if torch.cuda.is_available()
-                else torch.device("cpu")
-            )
         self.device = device
+        self.repo_root = Path(__file__).resolve().parents[1]
+        self.image_size = int(_cfgv(config, "data", "image_size", default=256))
+        self.sample_steps = int(np.clip(int(getattr(args, "timesteps", 24) or 24), 8, 64))
+        self.model_path = _resolve_model_path(getattr(args, "model_path", None), self.repo_root)
+        self.model, self.diffusion, self.load_diag = self._load_model()
+        self.tile = self.image_size
+        self._last_reverse_diag: Dict[str, Any] = {}
 
-        self.model_var_type = config.model.var_type
-        betas = get_beta_schedule(
-            beta_schedule=config.diffusion.beta_schedule,
-            beta_start=config.diffusion.beta_start,
-            beta_end=config.diffusion.beta_end,
-            num_diffusion_timesteps=config.diffusion.num_diffusion_timesteps,
-        )
-        betas = self.betas = torch.from_numpy(betas).float().to(self.device)
-        self.num_timesteps = betas.shape[0]
+    def _tile_overlap(self, task: str) -> int:
+        t = self.tile
+        if task == "inp_em":
+            return min(max(int(t * 0.44), 88), t - 28)
+        if task == "deblur_em" or (isinstance(task, str) and task.startswith("sr")):
+            return min(max(int(t * 0.36), 72), t - 28)
+        return min(max(int(t * 0.30), 56), t - 32)
 
-        alphas = 1.0 - betas
-        alphas_cumprod = alphas.cumprod(dim=0)
-        alphas_cumprod_prev = torch.cat(
-            [torch.ones(1).to(device), alphas_cumprod[:-1]], dim=0
-        )
-        self.alphas_cumprod_prev = alphas_cumprod_prev
-        posterior_variance = (
-            betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
-        )
-        if self.model_var_type == "fixedlarge":
-            self.logvar = betas.log()
-        elif self.model_var_type == "fixedsmall":
-            self.logvar = posterior_variance.clamp(min=1e-20).log()
-
-        try:
-            self.lpips_fn = lpips.LPIPS(net='vgg').to(self.device)
-        except ImportError as e:
-            logger.error(f"Failed to load LPIPS model: {str(e)}")
-            raise
-
-        # Store previous batch patch information
-        self.prev_patches = None
-        self.prev_positions = None
-        self.prev_padded_size = None
-        self.prev_batch = None  # Store previous batch data
-
-    def process_batch_with_prev_info(self, prev_batch, current_batch, config):
-        try:
-            from tools.EMSVD import IsotropicEM
-            if not isinstance(current_batch, torch.Tensor) or len(current_batch.shape) != 4:
-                raise ValueError("Current batch must be a 4D torch tensor")
-            channels = current_batch.shape[1]
-            patch_size = config.data.image_size
-            overlap = self.args.overlap if hasattr(self.args, 'overlap') else 16
-
-            # Split current batch into patches
-            current_patches, current_positions, current_padded_size = self.crop_to_patches(
-                current_batch, patch_size, overlap
+    def _load_model(self):
+        cache_key = f"{self.model_path}|{self.sample_steps}|{self.device.type}"
+        if cache_key in _BACKBONE_CACHE:
+            return _BACKBONE_CACHE[cache_key]
+        if not self.model_path.is_file():
+            raise FileNotFoundError(
+                f"External diffusion model checkpoint not found: {self.model_path}"
             )
-            processed_patches = []
 
-            # Check if IsotropicEM has process method
-            if not hasattr(IsotropicEM, 'process'):
-                logger.error("IsotropicEM class lacks process method")
-                raise AttributeError("IsotropicEM class lacks process method")
+        model_cfg = {
+            "image_size": int(_cfgv(self.config, "model", "image_size", default=self.image_size)),
+            "learn_sigma": bool(_cfgv(self.config, "model", "learn_sigma", default=True)),
+            "num_channels": int(_cfgv(self.config, "model", "num_channels", default=256)),
+            "num_res_blocks": int(_cfgv(self.config, "model", "num_res_blocks", default=2)),
+            "channel_mult": _cfgv(self.config, "model", "channel_mult", default=""),
+            "num_heads": int(_cfgv(self.config, "model", "num_heads", default=4)),
+            "num_head_channels": int(_cfgv(self.config, "model", "num_head_channels", default=64)),
+            "attention_resolutions": str(_cfgv(self.config, "model", "attention_resolutions", default="32,16,8")),
+            "dropout": float(_cfgv(self.config, "model", "dropout", default=0.0)),
+            "diffusion_steps": int(_cfgv(self.config, "diffusion", "num_diffusion_timesteps", default=1500)),
+            "noise_schedule": str(_cfgv(self.config, "diffusion", "beta_schedule", default="linear")),
+            "timestep_respacing": f"ddim{self.sample_steps}",
+            "use_kl": False,
+            "predict_xstart": False,
+            "rescale_timesteps": False,
+            "rescale_learned_sigmas": False,
+            "use_checkpoint": False,
+            "use_scale_shift_norm": bool(_cfgv(self.config, "model", "use_scale_shift_norm", default=True)),
+            "resblock_updown": bool(_cfgv(self.config, "model", "resblock_updown", default=True)),
+            "use_fp16": bool(_cfgv(self.config, "model", "use_fp16", default=False)) and self.device.type == "cuda",
+            "use_new_attention_order": bool(_cfgv(self.config, "model", "use_new_attention_order", default=True)),
+        }
+        model, diffusion = create_model_and_diffusion(**model_cfg)
+        state = load_state_dict(str(self.model_path), map_location="cpu")
+        state = _clean_state_dict(state)
+        try:
+            missing, unexpected = model.load_state_dict(state, strict=False)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load external diffusion model checkpoint {self.model_path}: {exc}"
+            ) from exc
+        allow_partial = bool(getattr(self.args, "allow_partial_model_load", False))
+        if (missing or unexpected) and not allow_partial:
+            raise RuntimeError(
+                "External diffusion model checkpoint does not match the configured architecture. "
+                f"missing_keys={list(missing)[:20]}, unexpected_keys={list(unexpected)[:20]}. "
+                "Set args.allow_partial_model_load=True only if this mismatch is intentional."
+            )
+        if not callable(getattr(model, "forward", None)):
+            raise RuntimeError("External diffusion model must be a torch module with a callable forward().")
+        if not hasattr(diffusion, "p_mean_variance") or not hasattr(diffusion, "q_sample"):
+            raise RuntimeError("Diffusion object must provide p_mean_variance() and q_sample().")
+        model.to(self.device)
+        model.eval()
+        diag = {
+            "model_path": str(self.model_path),
+            "missing_keys": list(missing),
+            "unexpected_keys": list(unexpected),
+            "sample_steps": self.sample_steps,
+            "external_model_required": True,
+            "heuristic_fallback_enabled": False,
+        }
+        _BACKBONE_CACHE[cache_key] = (model, diffusion, diag)
+        return model, diffusion, diag
 
-            if prev_batch is None or self.prev_patches is None:
-                # If no previous batch or patch info, process current batch independently
-                logger.info("No previous batch data or patch info, processing current batch independently")
-                h_funcs = IsotropicEM(
-                    channels=channels,
-                    img_dim=patch_size,
-                    device=self.device,
-                    kernel_size=3,
-                    sigma_x=1.0,
-                    sigma_y=1.0,
-                    sigma_z=2.0,
-                    use_prev_img_info=False
+    def restore_from_svd(
+        self,
+        *,
+        task: str,
+        obs_tensor: torch.Tensor,
+        obs_gray: np.ndarray,
+        linear_gray: np.ndarray,
+        svd_gray: np.ndarray,
+        strength: float,
+        metrics: Dict[str, float],
+        linear_meta: Dict[str, Any],
+        svd_meta: Dict[str, Any],
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        nonlinear = self._restore_gray(task, obs_gray, linear_gray, svd_gray, strength, linear_meta, svd_meta)
+        diag = dict(self.load_diag)
+        if task == "inp_em":
+            diag["inp_reverse_diag"] = self._last_reverse_diag
+        return nonlinear, {
+            "mode": "model_2562_reverse_from_svd",
+            "model_path": str(self.model_path),
+            "load_diag": diag,
+        }
+
+    def _restore_gray(
+        self,
+        task: str,
+        obs_gray: np.ndarray,
+        linear_gray: np.ndarray,
+        svd_gray: np.ndarray,
+        strength: float,
+        linear_meta: Dict[str, Any],
+        svd_meta: Dict[str, Any],
+    ) -> np.ndarray:
+        maps = linear_meta.get("maps") or {}
+        guide_map = svd_meta.get("guidance_map")
+        if guide_map is None:
+            guide_map = linear_meta.get("support")
+        if guide_map is None:
+            guide_map = norm01(np.abs(linear_gray - svd_gray))
+        hole_map = linear_meta.get("mask", svd_meta.get("mask"))
+        if hole_map is None:
+            hole_map = np.zeros_like(guide_map, dtype=np.float32)
+        conf_map = linear_meta.get("hole_confidence", svd_meta.get("hole_confidence"))
+        if not isinstance(conf_map, np.ndarray) or conf_map.shape != hole_map.shape:
+            conf_map = np.ones_like(hole_map, dtype=np.float32)
+        else:
+            conf_map = clip01(conf_map.astype(np.float32))
+        anis_map = maps.get("anis_map", np.zeros_like(guide_map, dtype=np.float32))
+        weak_vertical = bool(float(maps.get("weak_axis_vertical", 0.0))) if "weak_axis_vertical" in maps else False
+
+        membrane_guide = None
+        line_closure_pad: Optional[np.ndarray] = None
+        lumen_pad: Optional[np.ndarray] = None
+        break_pad: Optional[np.ndarray] = None
+        bridge_pad: Optional[np.ndarray] = None
+        if task == "inp_em":
+            mo = maps.get("membrane")
+            ro = maps.get("ridge")
+            if isinstance(mo, np.ndarray) and isinstance(ro, np.ndarray) and mo.shape == obs_gray.shape and ro.shape == obs_gray.shape:
+                membrane_guide = clip01(0.46 * mo.astype(np.float32) + 0.54 * ro.astype(np.float32))
+            elif isinstance(mo, np.ndarray) and mo.shape == obs_gray.shape:
+                membrane_guide = clip01(mo.astype(np.float32))
+            lp = maps.get("lumen_protect")
+            if isinstance(lp, np.ndarray) and lp.shape == obs_gray.shape:
+                lumen_pad = clip01(lp.astype(np.float32))
+            lc = maps.get("line_closure")
+            if isinstance(lc, np.ndarray) and lc.shape == obs_gray.shape:
+                lc = clip01(lc.astype(np.float32))
+                if lumen_pad is not None:
+                    lc = clip01(lc * (1.0 - 0.80 * lumen_pad))
+                line_closure_pad = lc
+                conf_map = clip01(np.maximum(conf_map, lc * 0.45))
+                if membrane_guide is not None:
+                    membrane_guide = clip01(0.62 * membrane_guide + 0.38 * lc)
+            if lumen_pad is not None:
+                conf_map = clip01(conf_map * (1.0 - 0.58 * lumen_pad))
+                if membrane_guide is not None:
+                    membrane_guide = clip01(membrane_guide * (1.0 - 0.38 * lumen_pad))
+            bs = maps.get("break_saliency")
+            if isinstance(bs, np.ndarray) and bs.shape == obs_gray.shape:
+                break_pad = clip01(bs.astype(np.float32))
+                if lumen_pad is not None:
+                    break_pad = clip01(break_pad * (1.0 - 0.88 * lumen_pad))
+            bt = linear_meta.get("bridge_target", maps.get("bridge_target", svd_meta.get("bridge_target")))
+            if isinstance(bt, np.ndarray) and bt.shape == obs_gray.shape:
+                bridge_pad = clip01(bt.astype(np.float32))
+                if lumen_pad is not None:
+                    bridge_pad = clip01(bridge_pad * (1.0 - 0.70 * lumen_pad) + linear_gray * (0.70 * lumen_pad))
+
+        h, w = obs_gray.shape
+        iso_prev_lin_pad: Optional[np.ndarray] = None
+        iso_prev_svd_pad: Optional[np.ndarray] = None
+        iso_anchor_w = 0.0
+        if task == "isotropic_em":
+            sa = linear_meta.get("slice_align")
+            conf = 0.0
+            if isinstance(sa, dict):
+                conf = float(sa.get("confidence", sa.get("flow_confidence", 0.0)))
+            pl = linear_meta.get("iso_prev_linear")
+            ps = linear_meta.get("iso_prev_svd")
+            if isinstance(pl, np.ndarray) and pl.shape == (h, w) and conf > 0.05:
+                conf_eff = float(conf)
+                if conf_eff > 0.45:
+                    conf_eff = min(1.0, conf_eff * 1.10)
+                tdiff = norm01(np.abs(linear_gray.astype(np.float32) - pl.astype(np.float32)))
+                boost = float(np.clip((0.14 + 0.28 * float(np.clip(strength, 0.0, 1.55))) * conf_eff, 0.0, 0.52))
+                guide_map = clip01(guide_map.astype(np.float32) * (1.0 + boost * tdiff))
+                iso_prev_lin_pad = pl.astype(np.float32)
+                if isinstance(ps, np.ndarray) and ps.shape == (h, w):
+                    iso_prev_svd_pad = ps.astype(np.float32)
+                iso_anchor_w = float(np.clip(conf_eff * (0.08 + 0.16 * float(np.clip(strength, 0.0, 1.55))), 0.0, 0.26))
+
+        tile = self.tile
+        overlap = self._tile_overlap(task)
+        step = max(20, tile - overlap)
+        pad_h = max(tile - h, 0)
+        pad_w = max(tile - w, 0)
+        if pad_h or pad_w:
+            obs_gray = np.pad(obs_gray, ((0, pad_h), (0, pad_w)), mode="reflect")
+            linear_gray = np.pad(linear_gray, ((0, pad_h), (0, pad_w)), mode="reflect")
+            svd_gray = np.pad(svd_gray, ((0, pad_h), (0, pad_w)), mode="reflect")
+            guide_map = np.pad(guide_map, ((0, pad_h), (0, pad_w)), mode="reflect")
+            hole_map = np.pad(hole_map, ((0, pad_h), (0, pad_w)), mode="reflect")
+            conf_map = np.pad(conf_map, ((0, pad_h), (0, pad_w)), mode="reflect")
+            anis_map = np.pad(anis_map, ((0, pad_h), (0, pad_w)), mode="reflect")
+            if membrane_guide is not None:
+                membrane_guide = np.pad(membrane_guide, ((0, pad_h), (0, pad_w)), mode="reflect")
+            if line_closure_pad is not None:
+                line_closure_pad = np.pad(line_closure_pad, ((0, pad_h), (0, pad_w)), mode="reflect")
+            if lumen_pad is not None:
+                lumen_pad = np.pad(lumen_pad, ((0, pad_h), (0, pad_w)), mode="reflect")
+            if break_pad is not None:
+                break_pad = np.pad(break_pad, ((0, pad_h), (0, pad_w)), mode="reflect")
+            if bridge_pad is not None:
+                bridge_pad = np.pad(bridge_pad, ((0, pad_h), (0, pad_w)), mode="reflect")
+            if iso_prev_lin_pad is not None:
+                iso_prev_lin_pad = np.pad(iso_prev_lin_pad, ((0, pad_h), (0, pad_w)), mode="reflect")
+            if iso_prev_svd_pad is not None:
+                iso_prev_svd_pad = np.pad(iso_prev_svd_pad, ((0, pad_h), (0, pad_w)), mode="reflect")
+
+        H, W = obs_gray.shape
+        ys = list(range(0, max(H - tile, 0) + 1, step))
+        xs = list(range(0, max(W - tile, 0) + 1, step))
+        if ys[-1] != H - tile:
+            ys.append(H - tile)
+        if xs[-1] != W - tile:
+            xs.append(W - tile)
+
+        acc = np.zeros((H, W), dtype=np.float32)
+        weight = np.zeros((H, W), dtype=np.float32)
+        wy = np.hanning(tile) if tile > 1 else np.ones(1, dtype=np.float32)
+        wx = np.hanning(tile) if tile > 1 else np.ones(1, dtype=np.float32)
+        win = (wy[:, None] * wx[None, :]).astype(np.float32)
+        win = np.maximum(win, 1e-3)
+
+        inp_gate_means: List[float] = []
+        inp_pull_inside: List[float] = []
+        inp_pull_outside: List[float] = []
+        for yi in ys:
+            for xi in xs:
+                obs_patch = obs_gray[yi:yi + tile, xi:xi + tile]
+                lin_patch = linear_gray[yi:yi + tile, xi:xi + tile]
+                svd_patch = svd_gray[yi:yi + tile, xi:xi + tile]
+                g_patch = guide_map[yi:yi + tile, xi:xi + tile]
+                h_patch = hole_map[yi:yi + tile, xi:xi + tile]
+                c_patch = conf_map[yi:yi + tile, xi:xi + tile]
+                a_patch = anis_map[yi:yi + tile, xi:xi + tile]
+                mg_patch = membrane_guide[yi:yi + tile, xi:xi + tile] if membrane_guide is not None else None
+                lc_patch = line_closure_pad[yi:yi + tile, xi:xi + tile] if line_closure_pad is not None else None
+                lp_patch = lumen_pad[yi:yi + tile, xi:xi + tile] if lumen_pad is not None else None
+                br_patch = break_pad[yi:yi + tile, xi:xi + tile] if break_pad is not None else None
+                bt_patch = bridge_pad[yi:yi + tile, xi:xi + tile] if bridge_pad is not None else None
+                pl_patch = (
+                    iso_prev_lin_pad[yi : yi + tile, xi : xi + tile] if iso_prev_lin_pad is not None else None
                 )
-                for patch in current_patches:
-                    processed_patches.append(h_funcs.process(patch))
-            else:
-                # Split previous batch (ensure same splitting parameters)
-                prev_patches, prev_positions, prev_padded_size = self.prev_patches, self.prev_positions, self.prev_padded_size
+                ps_patch = (
+                    iso_prev_svd_pad[yi : yi + tile, xi : xi + tile] if iso_prev_svd_pad is not None else None
+                )
+                out, patch_diag = self._reverse_patch(
+                    task,
+                    obs_patch,
+                    lin_patch,
+                    svd_patch,
+                    g_patch,
+                    h_patch,
+                    c_patch,
+                    a_patch,
+                    strength,
+                    weak_vertical,
+                    mg_patch,
+                    lc_patch,
+                    lp_patch,
+                    br_patch,
+                    bt_patch,
+                    iso_prev_lin_patch=pl_patch,
+                    iso_prev_svd_patch=ps_patch,
+                    iso_anchor_w=iso_anchor_w,
+                )
+                acc[yi:yi + tile, xi:xi + tile] += out * win
+                weight[yi:yi + tile, xi:xi + tile] += win
+                if task == "inp_em":
+                    if "gate_mean" in patch_diag:
+                        inp_gate_means.append(float(patch_diag["gate_mean"]))
+                    if "pull_inside" in patch_diag:
+                        inp_pull_inside.append(float(patch_diag["pull_inside"]))
+                    if "pull_outside" in patch_diag:
+                        inp_pull_outside.append(float(patch_diag["pull_outside"]))
 
-                # Check if patch counts match
-                if len(prev_patches) != len(current_patches):
-                    logger.warning(f"Previous batch patch count {len(prev_patches)} does not match current {len(current_patches)}")
-                    h_funcs = IsotropicEM(
-                        channels=channels,
-                        img_dim=patch_size,
-                        device=self.device,
-                        kernel_size=3,
-                        sigma_x=1.0,
-                        sigma_y=1.0,
-                        sigma_z=2.0,
-                        use_prev_img_info=False
-                    )
-                    for patch in current_patches:
-                        processed_patches.append(h_funcs.process(patch))
-                else:
-                    # Process patches with matching
-                    for idx, (current_patch, current_pos) in enumerate(zip(current_patches, current_positions)):
-                        # Find closest previous batch patch
-                        min_dist = float('inf')
-                        best_prev_patch = None
-                        for prev_patch, prev_pos in zip(prev_patches, prev_positions):
-                            dist = ((current_pos[0] - prev_pos[0])**2 + (current_pos[1] - prev_pos[1])**2)**0.5
-                            if dist < min_dist:
-                                min_dist = dist
-                                best_prev_patch = prev_patch
+        fused = acc / np.maximum(weight, 1e-6)
+        if task == "inp_em":
+            self._last_reverse_diag = {
+                "generateGate_mean": float(np.mean(inp_gate_means)) if inp_gate_means else 0.0,
+                "inp_pull_inside": float(np.mean(inp_pull_inside)) if inp_pull_inside else 0.0,
+                "inp_pull_outside": float(np.mean(inp_pull_outside)) if inp_pull_outside else 0.0,
+            }
+        else:
+            self._last_reverse_diag = {}
+        return clip01(fused[:h, :w])
 
-                        if best_prev_patch is None or min_dist > patch_size:
-                            logger.warning(f"Patch {idx} found no matching previous batch patch, processing independently")
-                            h_funcs = IsotropicEM(
-                                channels=channels,
-                                img_dim=patch_size,
-                                device=self.device,
-                                kernel_size=3,
-                                sigma_x=1.0,
-                                sigma_y=1.0,
-                                sigma_z=2.0,
-                                use_prev_img_info=False
-                            )
-                            processed_patches.append(h_funcs.process(current_patch))
-                        else:
-                            logger.debug(f"Patch {idx} matched to previous batch patch, distance {min_dist:.2f}")
-                            h_funcs = IsotropicEM(
-                                channels=channels,
-                                img_dim=patch_size,
-                                device=self.device,
-                                kernel_size=3,
-                                sigma_x=1.0,
-                                sigma_y=1.0,
-                                sigma_z=2.0,
-                                use_prev_img_info=True
-                            )
-                            processed_patches.append(h_funcs.process_with_prev_info(best_prev_patch, current_patch))
+    def _reverse_patch(
+        self,
+        task: str,
+        obs_patch: np.ndarray,
+        lin_patch: np.ndarray,
+        svd_patch: np.ndarray,
+        guide_patch: np.ndarray,
+        hole_patch: np.ndarray,
+        conf_patch: np.ndarray,
+        anis_patch: np.ndarray,
+        strength: float,
+        weak_vertical: bool,
+        membrane_patch: Optional[np.ndarray] = None,
+        line_closure_patch: Optional[np.ndarray] = None,
+        lumen_protect_patch: Optional[np.ndarray] = None,
+        break_saliency_patch: Optional[np.ndarray] = None,
+        bridge_patch: Optional[np.ndarray] = None,
+        iso_prev_lin_patch: Optional[np.ndarray] = None,
+        iso_prev_svd_patch: Optional[np.ndarray] = None,
+        iso_anchor_w: float = 0.0,
+    ) -> Tuple[np.ndarray, Dict[str, float]]:
+        tail = float(np.mean(np.abs(lin_patch - svd_patch)))
+        residual_energy = float(np.mean(np.abs(obs_patch - svd_patch)))
+        start_idx = diffusion_start_ratio(task, strength, tail, residual_energy, self.diffusion.num_timesteps)
 
-            # Update previous batch patch information
-            self.prev_patches = current_patches
-            self.prev_positions = current_positions
-            self.prev_padded_size = current_padded_size
-            self.prev_batch = current_batch.clone()  # Update previous batch data
+        x_obs = gray01_to_three_m11(obs_patch, self.device)
+        x_linear = gray01_to_three_m11(lin_patch, self.device)
+        x_svd = gray01_to_three_m11(svd_patch, self.device)
 
-            return processed_patches, current_positions, current_padded_size
-        except (ValueError, AttributeError) as e:
-            logger.error(f"Batch processing error: {str(e)}")
-            raise
+        guide_map = torch.from_numpy(clip01(guide_patch))[None, None].to(self.device)
+        hole_map = torch.from_numpy(clip01(hole_patch))[None, None].to(self.device)
+        hole_conf_t = torch.from_numpy(clip01(conf_patch))[None, None].to(self.device)
+        anis_map = torch.from_numpy(clip01(anis_patch))[None, None].to(self.device)
+        membrane_guide_t = None
+        if membrane_patch is not None:
+            membrane_guide_t = torch.from_numpy(clip01(membrane_patch))[None, None].to(self.device)
+        line_closure_t = None
+        if line_closure_patch is not None:
+            line_closure_t = torch.from_numpy(clip01(line_closure_patch))[None, None].to(self.device)
+        lumen_protect_t = None
+        if lumen_protect_patch is not None:
+            lumen_protect_t = torch.from_numpy(clip01(lumen_protect_patch))[None, None].to(self.device)
+        break_saliency_t = None
+        if break_saliency_patch is not None:
+            break_saliency_t = torch.from_numpy(clip01(break_saliency_patch))[None, None].to(self.device)
+        bridge_target_t = None
+        if bridge_patch is not None:
+            bridge_target_t = gray01_to_three_m11(clip01(bridge_patch), self.device)
 
-    def crop_to_patches(self, image, patch_size, overlap):
-        try:
-            if not isinstance(image, torch.Tensor) or len(image.shape) != 4:
-                raise ValueError("Input image must be a 4D torch tensor")
-            if patch_size <= 0 or overlap < 0:
-                raise ValueError(f"Invalid patch_size {patch_size} or overlap {overlap}")
-            b, c, h, w = image.shape
-            if h < patch_size or w < patch_size:
-                logger.info(f"Image size {h}x{w} smaller than patch size {patch_size}x{patch_size}, using whole image")
-                return [image], [(0, 0)], (h, w)
-            
-            stride = patch_size - overlap
-            patches = []
-            positions = []
-            num_patches_h = (h - patch_size) // stride + 1
-            num_patches_w = (w - patch_size) // stride + 1
-            for y in range(num_patches_h):
-                for x in range(num_patches_w):
-                    y_start = y * stride
-                    y_end = y_start + patch_size
-                    x_start = x * stride
-                    x_end = x_start + patch_size
-                    patch = image[:, :, y_start:y_end, x_start:x_end]
-                    patches.append(patch)
-                    positions.append((y_start, x_start))
-            if (h - patch_size) % stride != 0:
-                y_start = h - patch_size
-                for x in range(num_patches_w):
-                    x_start = x * stride
-                    x_end = x_start + patch_size
-                    patch = image[:, :, y_start:h, x_start:x_end]
-                    patches.append(patch)
-                    positions.append((y_start, x_start))
-            if (w - patch_size) % stride != 0:
-                x_start = w - patch_size
-                for y in range(num_patches_h):
-                    y_start = y * stride
-                    y_end = y_start + patch_size
-                    patch = image[:, :, y_start:y_end, x_start:w]
-                    patches.append(patch)
-                    positions.append((y_start, x_start))
-            if (h - patch_size) % stride != 0 and (w - patch_size) % stride != 0:
-                y_start = h - patch_size
-                x_start = w - patch_size
-                patch = image[:, :, y_start:h, x_start:w]
-                patches.append(patch)
-                positions.append((y_start, x_start))
-            return patches, positions, (h, w)
-        except ValueError as e:
-            logger.error(f"Patch cropping error: {str(e)}")
-            raise
+        detail_seed = x_linear - x_svd
+        detail_seed = detail_seed / (detail_seed.abs().amax(dim=(1, 2, 3), keepdim=True) + 1e-6)
+        rand_noise = torch.randn_like(x_svd)
+        noise = (0.68 * rand_noise + 0.32 * detail_seed).clamp(-3.0, 3.0)
+        t0 = torch.tensor([start_idx], device=self.device, dtype=torch.long)
+        x = self.diffusion.q_sample(x_svd, t0, noise=noise)
 
-
-    def stitch_patches(self,
-                    patches: List[torch.Tensor],
-                    positions: List[Tuple[int, int]],
-                    original_size: Tuple[int, int],
-                    patch_size: int,
-                    overlap: int,
-                    upscale_ratio: int = 1) -> torch.Tensor:
-        try:
-            if not patches:
-                raise ValueError("No patches provided")
-            B, C, pH, pW = patches[0].shape
-            target_h = patch_size * upscale_ratio
-            target_w = patch_size * upscale_ratio
-            for i, p in enumerate(patches):
-                if p.shape[2:] != (target_h, target_w):
-                    patches[i] = F.interpolate(
-                        p, size=(target_h, target_w),
-                        mode='bilinear', align_corners=False)
-            H = original_size[0] * upscale_ratio
-            W = original_size[1] * upscale_ratio
-            stitched   = torch.zeros(B, C, H, W, device=self.device, dtype=torch.float32)
-            weight_map = torch.zeros(B, C, H, W, device=self.device, dtype=torch.float32)
-            ramp_h = torch.linspace(0, 1, target_h, device=self.device)
-            ramp_w = torch.linspace(0, 1, target_w, device=self.device)
-            ramp_h = torch.min(ramp_h, 1 - ramp_h)
-            ramp_w = torch.min(ramp_w, 1 - ramp_w)
-            ramp = torch.outer(ramp_h, ramp_w).clamp(min=1e-6)
-
-            if overlap * upscale_ratio < 4:
-                ramp = torch.ones_like(ramp)
-            for patch, (y0, x0) in zip(patches, positions):
-                y0 = y0 * upscale_ratio
-                x0 = x0 * upscale_ratio
-                y1 = min(y0 + target_h, H)
-                x1 = min(x0 + target_w, W)
-
-                patch_crop = patch[:, :, :y1 - y0, :x1 - x0]
-                ramp_crop  = ramp[:y1 - y0, :x1 - x0]
-                w = ramp_crop.unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1)
-
-                stitched[:, :, y0:y1, x0:x1]   += patch_crop * w
-                weight_map[:, :, y0:y1, x0:x1] += w
-            weight_map = torch.clamp(weight_map, min=1e-6)
-            stitched = stitched / weight_map
-
-            blurred = F.avg_pool2d(stitched, kernel_size=3, stride=1, padding=1)
-            high_freq = stitched - blurred
-            stitched = stitched + 0.2 * high_freq
-            stitched = torch.clamp(stitched, 0.0, 1.0)
-
-            logger.info(f"Stitched image size: {stitched.shape[2]}x{stitched.shape[3]}")
-            return stitched
-
-        except Exception as e:
-            logger.error(f"Patch stitching error: {str(e)}")
-            raise
-
-    def sample_sequence(self, model, cls_fn=None):
-        try:
-            args, config = self.args, self.config
-            dataset, test_dataset = get_dataset(args, config)
-            if args.subset_start >= 0 and args.subset_end > 0:
-                if args.subset_end <= args.subset_start:
-                    raise ValueError("subset_end must be greater than subset_start")
-                test_dataset = torch.utils.data.Subset(test_dataset, range(args.subset_start, args.subset_end))
-            else:
-                args.subset_start = 0
-                args.subset_end = len(test_dataset)
-            logger.info(f'Dataset size: {len(test_dataset)}')
-
-            def seed_worker(worker_id):
-                worker_seed = args.seed % 2**32
-                np.random.seed(worker_seed)
-                random.seed(worker_seed)
-
-            g = torch.Generator()
-            g.manual_seed(args.seed)
-            val_loader = data.DataLoader(
-                test_dataset,
-                batch_size=config.sampling.batch_size,
-                shuffle=False,
-                num_workers=config.data.num_workers,
-                worker_init_fn=seed_worker,
-                generator=g,
-            )
-
-            deg = args.deg
-            sigma_0 = args.sigma_0
-            overlap = args.overlap if hasattr(args, 'overlap') else 16
-            avg_psnr = 0.0
-            avg_ssim = 0.0
-            avg_lpips = 0.0
-            idx_init = args.subset_start
-            idx_so_far = args.subset_start
-            pbar = tqdm.tqdm(val_loader, disable=True)
-            for x_orig, classes in pbar:
-                try:
-                    x_orig = x_orig.to(self.device)
-                    x_orig = data_transform(self.config, x_orig)
-                    original_shape = x_orig.shape
-                    batch_size, channels, h, w = x_orig.shape
-
-                    input_is_gray = channels == 1
-                    if channels == 3:
-                        channel_diff = torch.max(torch.abs(x_orig[:, 0] - x_orig[:, 1]) + torch.abs(x_orig[:, 1] - x_orig[:, 2]))
-                        if channel_diff < 1e-5:
-                            input_is_gray = True
-                            logger.info("Detected 3-channel grayscale image, treating as grayscale")
-                        
-                    is_grayscale = input_is_gray 
-
-                    x_orig_padded, original_size, pad_offsets = pad_image(x_orig, min_size=256)
-                    block_size = max(x_orig_padded.shape[2], x_orig_padded.shape[3])
-                    use_patches = h >= config.data.image_size and w >= config.data.image_size
-
-                    patches, positions, padded_size = self.crop_to_patches(
-                        x_orig_padded, config.data.image_size, overlap
-                    )
-                    degraded_patches = []
-                    restored_patches = []
-                    upscale_ratio = 1
-                    use_prev = getattr(self.args, "use_prev_img_info", False)
-                    if deg == 'isotropic_em' and use_prev:
-                        patches, positions, padded_size = self.process_batch_with_prev_info(
-                            self.prev_batch, x_orig_padded, self.config
-                        )
-                        self.prev_batch = x_orig_padded.clone()
-                    else:
-                        self.prev_batch = None
-
-
-                    for patch_idx, patch in enumerate(patches):
-                        try:
-                            logger.debug(f"Processing patch {patch_idx + 1}/{len(patches)}, size {patch.shape[2]}x{patch.shape[3]}")
-
-                            if deg == 'inp_em':
-                                from tools.EMSVD import Inpainting
-                                loaded_image = patch[0].cpu().numpy().transpose(1, 2, 0)
-                                if input_is_gray and loaded_image.shape[2] == 3:
-                                    loaded_image = np.mean(loaded_image, axis=2)
-                                    is_grayscale = True
-                                try:
-                                    processed, membrane_mask = preprocess_image(loaded_image, is_grayscale=is_grayscale)
-                                except ValueError as ve:
-                                    logger.warning(f"Patch {patch_idx} preprocessing failed: {str(ve)}, using zero mask")
-                                    processed = loaded_image
-                                    membrane_mask = np.zeros((patch.shape[2], patch.shape[3]), dtype=np.uint8)
-                                membrane_mask = (membrane_mask == 255).astype(np.uint8)
-                                missing_pixels = torch.nonzero(torch.from_numpy(membrane_mask), as_tuple=False).long()
-                                H = patch.shape[2]
-                                W = patch.shape[3]
-                                linear_idx = missing_pixels[:, 0] * W + missing_pixels[:, 1]
-                                H_W = H * W
-                                missing = torch.cat([linear_idx + c * H_W for c in range(channels)], dim=0)
-                                H_funcs = Inpainting(channels, H, missing, self.device)
-                            elif deg == 'deno_em':
-                                from tools.EMSVD import EMDenoising
-                                H_funcs = EMDenoising(channels, patch.shape[2], self.device, sigma=1.2)
-                            elif deg == 'isotropic_em':
-                                from tools.EMSVD import IsotropicEM
-                                use_prev = getattr(self.args, "use_prev_img_info", False)
-                                H_funcs = IsotropicEM(
-                                    channels=channels,
-                                    img_dim=patch.shape[2],
-                                    device=self.device,
-                                    kernel_size=3,
-                                    sigma_x=1.0,
-                                    sigma_y=1.0,
-                                    sigma_z=2.0,
-                                    use_prev_img_info=use_prev
-                                )
-
-                            elif deg == 'deblur_em':
-                                from tools.EMSVD import EMDeblurring, make_ctf_kernel_1d
-                                pixel_size = getattr(self.args, "pixel_size", 1.5)            # Å
-                                lam = getattr(self.args, "electron_wavelength", 0.0197)      # Å
-                                defocus = getattr(self.args, "defocus", -15000.0)            # Å
-                                Cs = getattr(self.args, "Cs", 2.7e7)                         # Å
-                                amp_contrast = getattr(self.args, "amplitude_contrast", 0.07)
-                                bfactor = getattr(self.args, "bfactor", 0.0)
-                                ctf_kernel_size = getattr(self.args, "ctf_kernel_size", 11)
-
-                                kernel = make_ctf_kernel_1d(
-                                    img_dim=patch.shape[2],
-                                    kernel_size=ctf_kernel_size,
-                                    pixel_size=pixel_size,
-                                    lam=lam,
-                                    defocus=defocus,
-                                    Cs=Cs,
-                                    amp_contrast=amp_contrast,
-                                    bfactor=bfactor,
-                                    device=self.device,
-                                )
-
-                                deblur_alpha = getattr(self.args, "deblur_alpha", 1e-3)
-                                H_funcs = EMDeblurring(
-                                    kernel,
-                                    channels,
-                                    patch.shape[2],
-                                    self.device,
-                                    sigma=sigma_0,
-                                    alpha=deblur_alpha,
-                                )
-
-                            elif deg[:2] == 'sr':
-                                blur_by = int(deg[2:])
-                                from tools.EMSVD import SuperResolutionEM
-                                H_funcs = SuperResolutionEM(channels, patch.shape[2], blur_by, self.device, gaussian_sigma=0.8)
-                                upscale_ratio = blur_by
-                            else:
-                                logger.error(f"Unsupported degradation type: {deg}")
-                                raise ValueError(f"Unsupported degradation type: {deg}")
-
-                            y_0 = H_funcs.H(patch)
-                            y_0 = y_0 + sigma_0 * torch.randn_like(y_0)
-                            pinv_y_0 = H_funcs.H_pinv(y_0).view(
-                                y_0.shape[0],
-                                channels,
-                                patch.shape[2],
-                                patch.shape[3]
-                            )
-                            degraded_patches.append(pinv_y_0)
-
-                            x = torch.randn(patch.shape, device=self.device)
-                            with torch.no_grad():
-                                x, _ = self.sample_image(x, model, H_funcs, y_0, sigma_0, last=False, cls_fn=cls_fn, classes=classes)
-                            restored_patch = inverse_data_transform(config, x[-1]).to(self.device)
-                            if deg[:2] == 'sr':
-                                target_size = (patch.shape[2] * upscale_ratio, patch.shape[3] * upscale_ratio)
-                                restored_patch = F.interpolate(
-                                    restored_patch,
-                                    size=target_size,
-                                    mode='bilinear',
-                                    align_corners=False
-                                )
-                            restored_patches.append(restored_patch)
-
-                        except Exception as e:
-                            logger.error(f"Error processing patch {patch_idx}: {str(e)}")
-                            raise
-
-                    x_orig_full = self.stitch_patches(
-                        [inverse_data_transform(config, p) for p in patches],
-                        positions,
-                        padded_size,
-                        config.data.image_size if use_patches else padded_size[0],
-                        overlap,
-                        upscale_ratio=1
-                    )
-                    degraded_full = self.stitch_patches(
-                        degraded_patches,
-                        positions,
-                        padded_size,
-                        config.data.image_size if use_patches else padded_size[0],
-                        overlap,
-                        upscale_ratio=1
-                    )
-                    restored_full = self.stitch_patches(
-                        restored_patches,
-                        positions,
-                        padded_size,
-                        config.data.image_size if use_patches else padded_size[0],
-                        overlap,
-                        upscale_ratio=upscale_ratio
-                    )
-
-                    if padded_size != original_size:
-                        x_orig_full = crop_image(x_orig_full, original_size, pad_offsets, upscale_ratio=1)
-                        degraded_full = crop_image(degraded_full, original_size, pad_offsets, upscale_ratio=1)
-                        restored_full = crop_image(restored_full, original_size, pad_offsets, upscale_ratio=upscale_ratio)
-
-                    for i in range(batch_size):
-                        try:
-                            recon = restored_full[i]
-                            recon_np = recon.permute(1, 2, 0).cpu().numpy()
-                            if input_is_gray and recon_np.shape[2] == 3:
-                                recon_np = np.mean(recon_np, axis=2)
-                                is_grayscale = True
-                            recon_np = (recon_np * 255).clip(0, 255).astype(np.uint8)
-                            recon_sharpened = sharpen_edges(recon_np, alpha=2.0, beta=-1.0, is_grayscale=is_grayscale)
-                            if len(recon_sharpened.shape) == 2:
-                                recon = torch.from_numpy(recon_sharpened / 255.0).unsqueeze(0).float().to(self.device)
-                            else:
-                                recon = torch.from_numpy(recon_sharpened / 255.0).permute(2, 0, 1).float().to(self.device)
-                            if input_is_gray and recon.shape[0] == 3:
-                                recon = recon.mean(dim=0, keepdim=True)
-
-                            tvu.save_image(x_orig_full[i], os.path.join(self.args.image_folder, f"orig_{idx_so_far + i}.png"))
-                            tvu.save_image(degraded_full[i], os.path.join(self.args.image_folder, f"y0_{idx_so_far + i}.png"))
-                            tvu.save_image(recon, os.path.join(self.args.image_folder, f"{idx_so_far + i}_-1.png"))
-
-                            orig = x_orig_full[i]
-                            if input_is_gray and orig.shape[0] == 3:
-                                orig = orig.mean(dim=0, keepdim=True)
-                            if deg[:2] == 'sr':
-                                orig = F.interpolate(orig.unsqueeze(0), size=(recon.shape[1], recon.shape[2]), mode='bilinear', align_corners=False).squeeze(0)
-                            mse = torch.mean((recon.to(self.device) - orig) ** 2)
-                            psnr = 10 * torch.log10(1 / mse)
-                            avg_psnr += psnr
-
-                            recon_np = recon.permute(1, 2, 0).cpu().numpy()
-                            orig_np = orig.permute(1, 2, 0).cpu().numpy()
-                            min_dim = min(orig_np.shape[0], orig_np.shape[1])
-                            win_size = min(7, min_dim)
-                            if win_size % 2 == 0:
-                                win_size = win_size - 1
-                            if win_size < 3:
-                                logger.warning(f"Image {idx_so_far + i} too small ({orig_np.shape[0]}x{orig_np.shape[1]}), skipping SSIM")
-                                ssim_val = 0.0
-                            else:
-                                if input_is_gray:
-                                    ssim_val = skimage_ssim(
-                                        orig_np.squeeze(), recon_np.squeeze(),
-                                        data_range=1.0,
-                                        gaussian_weights=True,
-                                        sigma=1.5
-                                    )
-                                else:
-                                    ssim_val = skimage_ssim(
-                                        orig_np, recon_np,
-                                        data_range=1.0,
-                                        multichannel=True,
-                                        channel_axis=2,
-                                        win_size=win_size,
-                                        gaussian_weights=True,
-                                        sigma=1.5
-                                    )
-                            avg_ssim += ssim_val
-
-                            orig_input = orig.unsqueeze(0).to(self.device)
-                            recon_input = recon.unsqueeze(0).to(self.device)
-                            if input_is_gray:
-                                if orig_input.shape[1] == 1:
-                                    orig_input = orig_input.repeat(1, 3, 1, 1)
-                                if recon_input.shape[1] == 1:
-                                    recon_input = recon_input.repeat(1, 3, 1, 1)
-                            lpips_val = self.lpips_fn(orig_input * 2 - 1, recon_input * 2 - 1)
-                            avg_lpips += lpips_val.item()
-                        except Exception as e:
-                            logger.error(f"Error computing metrics for image {idx_so_far + i}: {str(e)}")
-                            continue
-
-                    idx_so_far += batch_size
-                    num_samples_done = idx_so_far - args.subset_start
-                    pbar.set_description(
-                        f"PSNR: {avg_psnr / num_samples_done:.2f}, SSIM: {avg_ssim / num_samples_done:.4f}, LPIPS: {avg_lpips / num_samples_done:.4f}"
-                    )
-
-                except Exception as e:
-                    logger.error(f"Error processing batch index {idx_so_far}: {str(e)}")
+        gate_mean = 0.0
+        pull_inside = 0.0
+        pull_outside = 0.0
+        with torch.no_grad():
+            for i in range(start_idx, -1, -1):
+                t = torch.tensor([i], device=self.device, dtype=torch.long)
+                out = self.diffusion.p_mean_variance(self.model, x, t, clip_denoised=True)
+                pred = em_guided_prediction(
+                    out["pred_xstart"],
+                    x_obs,
+                    x_linear,
+                    x_svd,
+                    guide_map,
+                    hole_map,
+                    anis_map,
+                    task,
+                    strength,
+                    i,
+                    start_idx,
+                    weak_vertical,
+                    hole_conf=hole_conf_t,
+                    membrane_guide=membrane_guide_t,
+                    line_closure=line_closure_t,
+                    lumen_protect=lumen_protect_t,
+                    break_saliency=break_saliency_t,
+                    bridge_target=bridge_target_t,
+                )
+                if i == 0:
+                    x = pred
                     continue
+                eps = self.diffusion._predict_eps_from_xstart(x, t, pred)
+                alpha_prev = _extract_into_tensor(self.diffusion.alphas_cumprod_prev, t, x.shape)
+                x = pred * torch.sqrt(alpha_prev) + torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * eps
+                if task == "inp_em":
+                    pull = 0.0005 + 0.0035 * (float(i) / max(float(start_idx), 1.0))
+                    anchor = 0.10 * x_svd + 0.12 * x_linear + 0.78 * x_obs
+                    repair_gate = hole_map
+                    if line_closure_t is not None:
+                        repair_gate = torch.clamp(torch.maximum(repair_gate, 1.00 * line_closure_t), 0.0, 1.0)
+                    if break_saliency_t is not None:
+                        repair_gate = torch.clamp(torch.maximum(repair_gate, 0.92 * break_saliency_t), 0.0, 1.0)
+                    if bridge_target_t is not None:
+                        bridge_need_t = torch.clamp((x_linear - bridge_target_t) / 0.18, 0.0, 1.0)
+                        repair_gate = torch.clamp(torch.maximum(repair_gate, 0.96 * bridge_need_t), 0.0, 1.0)
+                    if lumen_protect_t is not None:
+                        repair_gate = repair_gate * (1.0 - 0.85 * lumen_protect_t)
+                    # hard floor for corridor gate
+                    if float(repair_gate.mean().detach().cpu()) < 0.06:
+                        q = torch.quantile(guide_map.flatten(1), 0.93, dim=1, keepdim=True).view(guide_map.shape[0], 1, 1, 1)
+                        forced_gate = (guide_map >= q).float()
+                        forced_gate = torch.nn.functional.avg_pool2d(forced_gate, kernel_size=9, stride=1, padding=4).clamp(0.0, 1.0)
+                        repair_gate = torch.maximum(repair_gate, 0.98 * forced_gate).clamp(0.0, 1.0)
+                    # Strong anchoring only outside repair corridor; inside, allow nonlinear generation.
+                    pull_map = torch.clamp(pull * (1.0 - 0.999 * repair_gate), 0.0, 1.0)
+                    gate_mean = max(gate_mean, float(repair_gate.mean().detach().cpu()))
+                    pull_inside = max(pull_inside, float((pull_map * repair_gate).mean().detach().cpu()))
+                    pull_outside = max(pull_outside, float((pull_map * (1.0 - repair_gate)).mean().detach().cpu()))
+                    x = x * (1.0 - pull_map) + anchor * pull_map
+                else:
+                    pull = 0.03 + 0.05 * (float(i) / max(float(start_idx), 1.0))
+                    anchor = 0.65 * x_svd + 0.25 * x_linear + 0.10 * x_obs
+                    if (
+                        task == "isotropic_em"
+                        and iso_anchor_w > 1e-6
+                        and iso_prev_lin_patch is not None
+                        and iso_prev_lin_patch.shape == lin_patch.shape
+                    ):
+                        x_prev_lin = gray01_to_three_m11(clip01(iso_prev_lin_patch), self.device)
+                        anchor = (1.0 - iso_anchor_w) * anchor + iso_anchor_w * (
+                            0.52 * x_svd + 0.22 * x_linear + 0.10 * x_obs + 0.16 * x_prev_lin
+                        )
+                        if iso_prev_svd_patch is not None and iso_prev_svd_patch.shape == svd_patch.shape:
+                            x_prev_svd = gray01_to_three_m11(clip01(iso_prev_svd_patch), self.device)
+                            anchor = anchor + (iso_anchor_w * 0.08) * (x_svd - x_prev_svd)
+                    x = x * (1.0 - pull) + anchor * pull
+                x = x.clamp(-1.0, 1.0)
 
-            num_samples = idx_so_far - args.subset_start
-            if num_samples > 0:
-                avg_psnr = avg_psnr / num_samples
-                avg_ssim = avg_ssim / num_samples
-                avg_lpips = avg_lpips / num_samples
-                logger.info(f"Overall average PSNR: {avg_psnr:.2f}")
-                logger.info(f"Overall average SSIM: {avg_ssim:.4f}")
-                logger.info(f"Overall average LPIPS: {avg_lpips:.4f}")
-                logger.info(f"Number of samples: {num_samples}")
-            else:
-                logger.warning("No samples processed successfully")
+        gray = ((x.clamp(-1.0, 1.0) + 1.0) * 0.5).mean(dim=1, keepdim=False)[0]
+        return gray.detach().cpu().numpy().astype(np.float32), {
+            "gate_mean": gate_mean,
+            "pull_inside": pull_inside,
+            "pull_outside": pull_outside,
+        }
 
-        except Exception as e:
-            logger.error(f"Sample sequence error: {str(e)}")
-            raise
 
-    def sample_image(self, x, model, H_funcs, y_0, sigma_0, last=True, cls_fn=None, classes=None):
-        try:
-            skip = self.num_timesteps // self.args.timesteps
-            seq = range(0, self.num_timesteps, skip)
-            x = efficient_generalized_steps(
-                x, 
-                seq, 
-                model,
-                self.betas, 
-                H_funcs, 
-                y_0, 
-                sigma_0, 
-                etaB=self.args.etaB, 
-                etaA=self.args.eta, 
-                etaC=self.args.eta, 
-                cls_fn=cls_fn, 
-                classes=classes
+# -----------------------------------------------------------------------------
+# Lightweight public wrappers
+# -----------------------------------------------------------------------------
+
+def linear_nonlinear_joint_restore_with_stages(
+    x_prior: torch.Tensor,
+    H_funcs: Optional[EMTaskOperator],
+    y_0: torch.Tensor,
+    deg: Optional[str] = None,
+    u_map: Optional[torch.Tensor] = None,
+    nonlinear_solver=None,
+):
+    del x_prior, u_map
+    task = deg or (H_funcs.task if isinstance(H_funcs, EMTaskOperator) else None) or "deno_em"
+    strength = getattr(H_funcs, "strength", 0.5)
+    if task == "adaptive":
+        if H_funcs is None:
+            H_funcs = make_operator("adaptive", y_0, strength)
+        final = direct_em_physics_restore(H_funcs, y_0, y_0, processing_degree=strength, task_name="adaptive")
+        res = H_funcs.last_result
+        return final, {"linear": res.linear, "svd_degraded": res.svd_degraded, "nonlinear": res.nonlinear, "final": res.final}
+    res = process_em_patch(y_0, task, strength, nonlinear_solver=nonlinear_solver)
+    return res.final, {"linear": res.linear, "svd_degraded": res.svd_degraded, "nonlinear": res.nonlinear, "final": res.final}
+
+
+
+def linear_nonlinear_joint_restore(
+    x_prior: torch.Tensor,
+    H_funcs: Optional[EMTaskOperator],
+    y_0: torch.Tensor,
+    deg: Optional[str] = None,
+    u_map: Optional[torch.Tensor] = None,
+    nonlinear_solver=None,
+):
+    out, _ = linear_nonlinear_joint_restore_with_stages(x_prior, H_funcs, y_0, deg=deg, u_map=u_map, nonlinear_solver=nonlinear_solver)
+    return out
+
+
+
+def build_adaptive_fused_h_and_y0(
+    patch: torch.Tensor,
+    channels: int,
+    patch_h: int,
+    patch_w: int,
+    device: torch.device,
+    processing_degree: float,
+    args,
+    patch_idx: int,
+    input_is_gray: bool = True,
+    is_grayscale: bool = True,
+):
+    del channels, patch_h, patch_w, device, args, input_is_gray, is_grayscale
+    op = make_operator("adaptive", patch, strength=processing_degree, patch_idx=patch_idx)
+    y_0 = patch.detach().clone()
+    sigma = float(np.clip(0.03 + 0.16 * processing_degree, 0.02, 0.20))
+    return op, y_0, sigma
+
+
+
+def finalize_em_output_uint8(image: np.ndarray, task: str, is_grayscale: bool = False) -> np.ndarray:
+    img = np.asarray(image)
+    gray = img if img.ndim == 2 else cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
+    g_raw = gray.astype(np.float32) / 255.0
+    g = g_raw.copy()
+    lo, hi = np.percentile(g, [0.8, 99.4])
+    g_stretch = np.clip((g - lo) / max(float(hi - lo), 1e-6), 0.0, 1.0)
+    # Keep postprocess mild: mostly preserve model output, only apply light tone normalization.
+    g = np.clip(0.80 * g_raw + 0.20 * g_stretch, 0.0, 1.0)
+    if task == "deblur_em":
+        g = np.clip(g + 0.025 * (g - cv2.GaussianBlur(g, (0, 0), 0.9)), 0.0, 1.0)
+    elif task.startswith("sr"):
+        g = np.clip(g + 0.03 * (g - cv2.GaussianBlur(g, (0, 0), 0.8)), 0.0, 1.0)
+    elif task == "deno_em":
+        g = cv2.GaussianBlur(g, (0, 0), 0.15)
+    elif task == "inp_em":
+        g = np.clip(g + 0.018 * (g - cv2.GaussianBlur(g, (0, 0), 0.40)), 0.0, 1.0)
+    out = (g * 255.0).round().astype(np.uint8)
+    return cv2.cvtColor(out, cv2.COLOR_GRAY2BGR) if (is_grayscale or img.ndim == 3) else out
+
+
+# -----------------------------------------------------------------------------
+# IO helpers
+# -----------------------------------------------------------------------------
+
+def _read_list_file(txt_path: str, root: str) -> List[Path]:
+    root_p = Path(root)
+    items: List[Path] = []
+    txt = Path(txt_path)
+    if txt.is_file():
+        for line in txt.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            stem = line.split()[0]
+            for ext in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"):
+                p = root_p / f"{stem}{ext}"
+                if p.exists():
+                    items.append(p)
+                    break
+    if items:
+        return items
+    return sorted([p for p in root_p.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}])
+
+
+
+def _to_gray_and_hint(img: np.ndarray):
+    if img.ndim == 2:
+        return img.astype(np.uint8), None
+    ycrcb = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2YCrCb)
+    return ycrcb[:, :, 0].astype(np.uint8), ycrcb
+
+
+
+def _gray_to_style(gray_u8: np.ndarray, color_hint: Optional[np.ndarray]):
+    if color_hint is None:
+        return gray_u8
+    ycrcb = color_hint.copy()
+    ycrcb[:, :, 0] = gray_u8
+    return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+
+
+
+def _jsonable(obj: Any) -> Any:
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    if isinstance(obj, np.ndarray):
+        return {
+            "shape": list(obj.shape),
+            "min": float(np.min(obj)),
+            "max": float(np.max(obj)),
+            "mean": float(np.mean(obj)),
+        }
+    if torch.is_tensor(obj):
+        t = obj.detach().float().cpu()
+        return {
+            "shape": list(t.shape),
+            "min": float(t.min()),
+            "max": float(t.max()),
+            "mean": float(t.mean()),
+        }
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    return str(obj)
+
+
+@dataclass
+class _ProcessedSample:
+    stem: str
+    linear: np.ndarray
+    svd: np.ndarray
+    nonlinear: np.ndarray
+    final: np.ndarray
+    debug: Dict[str, object]
+
+
+class Diffusion(object):
+    def __init__(self, args, config, device: Optional[torch.device] = None):
+        self.args = args
+        self.config = config
+        self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        self.root = getattr(getattr(config, "data", object()), "root", getattr(args, "exp", "."))
+        self.list_file = getattr(getattr(config, "data", object()), "txt", "")
+        self.output_dir = Path(args.image_folder)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.deg = args.deg
+        # Adaptive mode may use >1.0 to make per-task restoration scale visibly stronger.
+        self.processing_degree = float(np.clip(getattr(args, "sigma_0", 0.55), 0.0, 1.55))
+        self.apply_result_light_enhance = bool(getattr(args, "apply_result_light_enhance", False))
+        self.backbone: Optional[EMGenerativeBackbone] = None
+        self.status_cb = getattr(args, "status_cb", None)
+        self._iso_prev_gray: Optional[np.ndarray] = None
+        self._iso_prev_linear: Optional[np.ndarray] = None
+        self._iso_prev_svd: Optional[np.ndarray] = None
+        self._iso_prev_slice_align: Optional[Dict[str, Any]] = None
+
+    def _status(self, msg: str) -> None:
+        cb = self.status_cb
+        if callable(cb):
+            try:
+                cb(msg)
+            except Exception:
+                pass
+
+    def _get_backbone(self) -> EMGenerativeBackbone:
+        if self.backbone is None:
+            self._status("Loading diffusion backbone (model init)...")
+            self.backbone = EMGenerativeBackbone(self.args, self.config, self.device)
+        return self.backbone
+
+    def _process_single_task(
+        self,
+        obs: torch.Tensor,
+        task: str,
+        strength: float,
+        preview: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, object]]:
+        backbone = self._get_backbone()
+        res = process_em_patch(obs, task, strength, nonlinear_solver=backbone.restore_from_svd, preview=preview)
+        inp_gate_map = None
+        if task == "inp_em":
+            try:
+                lm = res.meta.get("linear_meta", {}) if isinstance(res.meta, dict) else {}
+                maps = (lm.get("maps") or {}) if isinstance(lm, dict) else {}
+                # Prefer corridor_soft; fall back to mask.
+                cand = maps.get("corridor_soft", lm.get("mask"))
+                if isinstance(cand, np.ndarray):
+                    inp_gate_map = np.asarray(cand, dtype=np.float32)
+            except Exception:
+                inp_gate_map = None
+        debug = {
+            "metrics": res.meta.get("metrics", {}),
+            "fusion_weight": res.meta.get("fusion_weight", 0.0),
+            "stage_diff_stats": res.meta.get("stage_diff_stats", {}),
+            "inp_diag": res.meta.get("inp_diag", {}),
+            "linear_meta": _jsonable(res.meta.get("linear_meta", {})),
+            "svd_meta": _jsonable(res.meta.get("svd_meta", {})),
+            "nonlinear_meta": _jsonable(res.meta.get("nonlinear_meta", {})),
+            "quality_metrics": res.meta.get("quality_metrics", {}),
+            "quality_assessment": _jsonable(res.meta.get("quality_assessment", {})),
+            "backbone": backbone.load_diag,
+        }
+        if inp_gate_map is not None:
+            debug["inp_gate_map"] = inp_gate_map
+            debug["inp_gate_ratio"] = float((inp_gate_map > 0.02).mean())
+        inp_rev = (((res.meta.get("nonlinear_meta", {}) or {}).get("load_diag", {}) or {}).get("inp_reverse_diag", {}))
+        if isinstance(inp_rev, dict) and inp_rev:
+            debug["inp_reverse_diag"] = _jsonable(inp_rev)
+        return res.final, {
+            "linear": res.linear,
+            "svd_degraded": res.svd_degraded,
+            "nonlinear": res.nonlinear,
+            "final": res.final,
+        }, debug
+
+    def _process_adaptive_tensor(self, obs: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, object]]:
+        fast = bool(getattr(self.args, "fast_adaptive", False))
+        # Routing stage: global metrics + observation-first SVD forward probes only (no linear, no diffusion).
+        t0 = time.perf_counter()
+        self._status(f"Adaptive routing probe (fast={fast})...")
+        plan = build_adaptive_plan(tensor_to_gray01(obs), self.processing_degree, fast_preview=fast)
+        t_plan = time.perf_counter()
+        sel = plan.get("selected_tasks", [])
+        w = plan.get("global_weights", {}) or {}
+        w_txt = ", ".join([f"{k}:{float(w.get(k, 0.0)):.3f}" for k in sel]) if sel else "none"
+        self._status(f"Routing selected: {sel} | weights: {w_txt}")
+        backbone = self._get_backbone()
+        t_bb = time.perf_counter()
+        result, debug = run_adaptive_chain(
+            obs,
+            self.processing_degree,
+            nonlinear_solver=backbone.restore_from_svd,
+            fast_preview=fast,
+            plan=plan,
+        )
+        t_done = time.perf_counter()
+        dbg = {
+            **debug,
+            "backbone": backbone.load_diag,
+            "timing": {
+                "routing_plan_s": float(t_plan - t0),
+                "backbone_init_s": float(t_bb - t_plan),
+                "adaptive_chain_s": float(t_done - t_bb),
+                "total_s": float(t_done - t0),
+            },
+        }
+        rm = dbg.get("routing_mode", "")
+        dbg["routing_mode"] = f"{rm}_model_reverse" if rm else "model_reverse"
+        return result.final, {
+            "linear": result.linear,
+            "svd_degraded": result.svd_degraded,
+            "nonlinear": result.nonlinear,
+            "final": result.final,
+        }, dbg
+
+    def _process_tensor(self, gray_u8: np.ndarray, preview: Optional[Dict[str, Any]] = None):
+        obs = gray01_to_tensor(gray_u8.astype(np.float32) / 255.0, device=self.device)
+        if self.deg == "adaptive":
+            return self._process_adaptive_tensor(obs)
+        return self._process_single_task(obs, self.deg, self.processing_degree, preview=preview)
+
+    def _tensor_to_u8(self, t: torch.Tensor) -> np.ndarray:
+        return (tensor_to_gray01(t) * 255.0).round().astype(np.uint8)
+
+    def _save_adaptive_debug(self, tag: str, debug: Dict[str, object], color_hint: Optional[np.ndarray]):
+        compact = {
+            "supported_tasks": debug.get("supported_tasks", []),
+            "selected_tasks": debug.get("selected_tasks", []),
+            "selected_weights": debug.get("selected_weights", {}),
+            "routing_softmax_weights": debug.get("routing_softmax_weights", {}),
+            "global_weights": debug.get("global_weights", {}),
+            "svd_scores": debug.get("svd_scores", {}),
+            "svd_response": debug.get("svd_response", {}),
+            "raw_scores": debug.get("raw_scores", {}),
+            "task_probe": _jsonable(debug.get("task_probe", {})),
+            "selection_reasons": debug.get("selection_reasons", {}),
+            "preview_strength": debug.get("preview_strength", 0.0),
+            "routing_mode": debug.get("routing_mode", ""),
+            "metrics": debug.get("metrics", {}),
+            "timing": _jsonable(debug.get("timing", {})),
+            "quality_metrics": debug.get("quality_metrics", {}),
+            "quality_assessment": _jsonable(debug.get("quality_assessment", {})),
+            "restoration_diag": _jsonable(debug.get("restoration_diag", {})),
+            "backbone": debug.get("backbone", {}),
+        }
+        (self.output_dir / f"routing_{tag}.json").write_text(json.dumps(_jsonable(compact), ensure_ascii=False, indent=2), encoding="utf-8")
+        for task, res in (debug.get("task_results", {}) or {}).items():
+            _save_stage(self.output_dir / f"adaptive_{tag}_{task}_linear.png", self._tensor_to_u8(res.linear), color_hint)
+            _save_stage(self.output_dir / f"adaptive_{tag}_{task}_svd_degraded.png", self._tensor_to_u8(res.svd_degraded), color_hint)
+            _save_stage(self.output_dir / f"adaptive_{tag}_{task}_nonlinear.png", self._tensor_to_u8(res.nonlinear), color_hint)
+            _save_stage(self.output_dir / f"adaptive_{tag}_{task}_final.png", self._tensor_to_u8(res.final), color_hint)
+            # Optional inp_em gate visualization
+            if task == "inp_em":
+                try:
+                    lm = res.meta.get("linear_meta", {}) if isinstance(res.meta, dict) else {}
+                    maps = (lm.get("maps") or {}) if isinstance(lm, dict) else {}
+                    gate = maps.get("corridor_soft", lm.get("mask"))
+                    if isinstance(gate, np.ndarray):
+                        gate_u8 = (np.clip(gate.astype(np.float32), 0.0, 1.0) * 255.0).round().astype(np.uint8)
+                        _save_stage(self.output_dir / f"inp_gate_{tag}.png", gate_u8, color_hint=None)
+                except Exception:
+                    pass
+
+    def _gray_to_u8_stages(
+        self,
+        gray_u8: np.ndarray,
+        color_hint: Optional[np.ndarray],
+        preview: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, object], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        final_t, stages, debug = self._process_tensor(gray_u8, preview)
+        linear = self._tensor_to_u8(stages["linear"])
+        svd = self._tensor_to_u8(stages["svd_degraded"])
+        nonlinear = self._tensor_to_u8(stages["nonlinear"])
+        final = self._tensor_to_u8(final_t)
+        return final_t, stages, debug, linear, svd, nonlinear, final
+
+    def _finalize_main_bgr(self, final: np.ndarray, color_hint: Optional[np.ndarray]) -> np.ndarray:
+        final_main = _gray_to_style(final, color_hint)
+        if self.apply_result_light_enhance:
+            final_main = finalize_em_output_uint8(final_main, self.deg, is_grayscale=(color_hint is None))
+        return final_main
+
+    def _process_path(self, path: Path, idx: int):
+        img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise ValueError(f"Unable to load {path}")
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = img[:, :, :3]
+        gray_u8, color_hint = _to_gray_and_hint(img)
+        preview: Optional[Dict[str, Any]] = None
+        if self.deg == "isotropic_em" and self._iso_prev_gray is not None:
+            preview = {
+                "prev_gray": self._iso_prev_gray,
+                "prev_linear": self._iso_prev_linear,
+                "prev_svd": self._iso_prev_svd,
+                "prev_slice_align": self._iso_prev_slice_align,
+            }
+        final_t, stages, debug, linear, svd, nonlinear, final = self._gray_to_u8_stages(gray_u8, color_hint, preview=preview)
+        if self.deg == "isotropic_em":
+            self._iso_prev_gray = np.clip(gray_u8.astype(np.float32) / 255.0, 0.0, 1.0)
+            self._iso_prev_linear = tensor_to_gray01(stages["linear"]).astype(np.float32)
+            self._iso_prev_svd = tensor_to_gray01(stages["svd_degraded"]).astype(np.float32)
+            lm = debug.get("linear_meta") if isinstance(debug, dict) else None
+            sa = lm.get("slice_align") if isinstance(lm, dict) else None
+            self._iso_prev_slice_align = dict(sa) if isinstance(sa, dict) else None
+        tag = str(idx)
+        _save_stage(self.output_dir / f"linear_{idx}.png", linear, color_hint)
+        _save_stage(self.output_dir / f"svd_degraded_{idx}.png", svd, color_hint)
+        _save_stage(self.output_dir / f"nonlinear_{idx}.png", nonlinear, color_hint)
+        _save_stage(self.output_dir / f"final_{idx}.png", final, color_hint)
+        final_main = self._finalize_main_bgr(final, color_hint)
+        cv2.imwrite(str(self.output_dir / f"{path.stem}_-1.png"), final_main)
+        if self.deg == "adaptive":
+            self._save_adaptive_debug(tag, debug, color_hint)
+        else:
+            # Optional inp_em gate visualization
+            try:
+                if self.deg == "inp_em" and isinstance(debug, dict):
+                    gate = debug.get("inp_gate_map")
+                    if isinstance(gate, np.ndarray):
+                        gate_u8 = (np.clip(gate.astype(np.float32), 0.0, 1.0) * 255.0).round().astype(np.uint8)
+                        _save_stage(self.output_dir / f"inp_gate_{tag}.png", gate_u8, color_hint=None)
+            except Exception:
+                pass
+            (self.output_dir / f"debug_{tag}.json").write_text(json.dumps(_jsonable(debug), ensure_ascii=False, indent=2), encoding="utf-8")
+        return _ProcessedSample(path.stem, linear, svd, nonlinear, final, debug)
+
+    def sample_z_stack(self, stack_z_hw: np.ndarray, stem: str) -> List[_ProcessedSample]:
+        """
+        Process each Z slice with the same 2D pipeline, stack linear/svd/nonlinear/final
+        into multi-page TIFFs, and write a middle-slice PNG for Qt preview.
+        """
+        self._iso_prev_gray = None
+        self._iso_prev_linear = None
+        self._iso_prev_svd = None
+        self._iso_prev_slice_align = None
+        vol = np.asarray(stack_z_hw)
+        if vol.ndim != 3:
+            raise ValueError(f"sample_z_stack expects (Z,H,W) uint8, got {vol.shape}")
+        if vol.dtype != np.uint8:
+            vol = np.clip(vol, 0, 255).astype(np.uint8)
+        z_depth = int(vol.shape[0])
+        mid = z_depth // 2
+        lin_l: List[np.ndarray] = []
+        svd_l: List[np.ndarray] = []
+        non_l: List[np.ndarray] = []
+        fin_gray_l: List[np.ndarray] = []
+        fin_main_l: List[np.ndarray] = []
+        last_debug: Dict[str, object] = {}
+        prev_gray: Optional[np.ndarray] = None
+        prev_lin: Optional[np.ndarray] = None
+        prev_svd: Optional[np.ndarray] = None
+        prev_slice_align: Optional[Dict[str, Any]] = None
+        for z in range(z_depth):
+            self._status(f"Z-stack slice {z + 1}/{z_depth} ...")
+            gray = vol[z]
+            preview: Optional[Dict[str, Any]] = None
+            if self.deg == "isotropic_em" and prev_gray is not None:
+                preview = {
+                    "prev_gray": prev_gray,
+                    "prev_linear": prev_lin,
+                    "prev_svd": prev_svd,
+                    "prev_slice_align": prev_slice_align,
+                }
+            _final_t, _stages, debug, linear, svd, nonlinear, final = self._gray_to_u8_stages(gray, None, preview=preview)
+            if self.deg == "isotropic_em":
+                prev_gray = np.clip(gray.astype(np.float32) / 255.0, 0.0, 1.0)
+                prev_lin = tensor_to_gray01(_stages["linear"]).astype(np.float32)
+                prev_svd = tensor_to_gray01(_stages["svd_degraded"]).astype(np.float32)
+                lm = debug.get("linear_meta") if isinstance(debug, dict) else None
+                sa = lm.get("slice_align") if isinstance(lm, dict) else None
+                prev_slice_align = dict(sa) if isinstance(sa, dict) else None
+            final_main = self._finalize_main_bgr(final, None)
+            lin_l.append(linear)
+            svd_l.append(svd)
+            non_l.append(nonlinear)
+            fin_gray_l.append(final)
+            fin_main_l.append(np.asarray(final_main))
+            if z == mid:
+                last_debug = debug
+            vol_cb = getattr(self.args, "volume_progress", None)
+            if callable(vol_cb):
+                try:
+                    vol_cb(z + 1, z_depth)
+                except Exception:
+                    pass
+            if self.deg == "adaptive" and z == mid:
+                self._save_adaptive_debug("vol_mid", debug, None)
+            elif self.deg != "adaptive" and z == mid:
+                try:
+                    (self.output_dir / "debug_vol_mid.json").write_text(
+                        json.dumps(_jsonable(debug), ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                    if self.deg == "inp_em" and isinstance(debug, dict):
+                        gate = debug.get("inp_gate_map")
+                        if isinstance(gate, np.ndarray):
+                            gate_u8 = (np.clip(gate.astype(np.float32), 0.0, 1.0) * 255.0).round().astype(np.uint8)
+                            _save_stage(self.output_dir / "inp_gate_vol_mid.png", gate_u8, color_hint=None)
+                except Exception:
+                    pass
+        vol_lin = np.stack(lin_l, axis=0)
+        vol_svd = np.stack(svd_l, axis=0)
+        vol_non = np.stack(non_l, axis=0)
+        vol_fin_g = np.stack(fin_gray_l, axis=0)
+        vol_fin_m = np.stack(fin_main_l, axis=0)
+        save_z_stack_tiff(str(self.output_dir / f"{stem}_linear.tif"), vol_lin)
+        save_z_stack_tiff(str(self.output_dir / f"{stem}_svd_degraded.tif"), vol_svd)
+        save_z_stack_tiff(str(self.output_dir / f"{stem}_nonlinear.tif"), vol_non)
+        save_z_stack_tiff(str(self.output_dir / f"{stem}_final.tif"), vol_fin_g)
+        save_z_stack_tiff(str(self.output_dir / f"{stem}_-1.tif"), vol_fin_m)
+        mid_main = fin_main_l[mid]
+        cv2.imwrite(str(self.output_dir / f"{stem}_-1_mid.png"), mid_main)
+        return [
+            _ProcessedSample(
+                stem,
+                lin_l[mid],
+                svd_l[mid],
+                non_l[mid],
+                fin_gray_l[mid],
+                last_debug,
             )
-            if last:
-                x = x[0][-1]
-            return x
-        except Exception as e:
-            logger.error(f"Error generating sample image: {str(e)}")
-            raise
+        ]
 
     def sample(self):
-        try:
-            cls_fn = None
-            if self.config.model.type == 'openai':
-                config_dict = vars(self.config.model)
-                model = create_model(**config_dict)
-                if self.config.model.use_fp16:
-                    model.convert_to_fp16()
-                model_path = r"C:\Users\du\Desktop\model_2562.pt"
-                model.load_state_dict(dist_util.load_state_dict(model_path, map_location="cuda"))
-                model.to(self.device)
-                model.eval()
-                model = torch.nn.DataParallel(model)
-            self.sample_sequence(model, cls_fn)
-        except Exception as e:
-            logger.error(f"Sampling error: {str(e)}")
-            raise
-
-def compute_alpha(beta, t):
-    beta = torch.cat([torch.zeros(1).to(beta.device), beta], dim=0)
-    a = (1 - beta).cumprod(dim=0).index_select(0, t + 1).view(-1, 1, 1, 1)
-    return a
-
-def efficient_generalized_steps(x, seq, model, b, H_funcs, y_0, sigma_0, etaB, etaA, etaC, cls_fn=None, classes=None):
-    try:
-        with torch.no_grad():
-            singulars = H_funcs.singulars()
-            Sigma = torch.zeros(x.shape[1]*x.shape[2]*x.shape[3], device=x.device)
-            Sigma[:singulars.shape[0]] = singulars
-            U_t_y = H_funcs.Ut(y_0)
-            Sig_inv_U_t_y = U_t_y / singulars[:U_t_y.shape[-1]]
-
-            largest_alphas = compute_alpha(b, (torch.ones(x.size(0)) * seq[-1]).to(x.device).long())
-            largest_sigmas = (1 - largest_alphas).sqrt() / largest_alphas.sqrt()
-            large_singulars_index = torch.where(singulars * largest_sigmas[0, 0, 0, 0] > sigma_0)
-            inv_singulars_and_zero = torch.zeros(x.shape[1] * x.shape[2] * x.shape[3]).to(singulars.device)
-            inv_singulars_and_zero[large_singulars_index] = sigma_0 / singulars[large_singulars_index]
-            inv_singulars_and_zero = inv_singulars_and_zero.view(1, -1)     
-
-            init_y = torch.zeros(x.shape[0], x.shape[1] * x.shape[2] * x.shape[3]).to(x.device)
-            init_y[:, large_singulars_index[0]] = U_t_y[:, large_singulars_index[0]] / singulars[large_singulars_index].view(1, -1)
-            init_y = init_y.view(*x.size())
-            remaining_s = largest_sigmas.view(-1, 1) ** 2 - inv_singulars_and_zero ** 2
-            remaining_s = remaining_s.view(x.shape[0], x.shape[1], x.shape[2], x.shape[3]).clamp_min(0.0).sqrt()
-            init_y = init_y + remaining_s * x
-            init_y = init_y / largest_sigmas
-            
-            x = H_funcs.V(init_y.view(x.size(0), -1)).view(*x.size())
-            n = x.size(0)
-            seq_next = [-1] + list(seq[:-1])
-            x0_preds = []
-            xs = [x]
-
-            for i, j in tqdm.tqdm(zip(reversed(seq), reversed(seq_next)), disable=True):
-                t = (torch.ones(n) * i).to(x.device)
-                next_t = (torch.ones(n) * j).to(x.device)
-                at = compute_alpha(b, t.long())
-                at_next = compute_alpha(b, next_t.long())
-                xt = xs[-1].to('cuda')
-                if cls_fn is None:
-                    et = model(xt, t)
-                else:
-                    et = model(xt, t, classes)
-                    et = et[:, :x.shape[1]]
-                    et = et - (1 - at).sqrt()[0,0,0,0] * cls_fn(x,t,classes)
-                
-                if et.size(1) > x.shape[1]:
-                    et = et[:, :x.shape[1]]
-                
-                x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
-
-                sigma = (1 - at).sqrt()[0, 0, 0, 0] / at.sqrt()[0, 0, 0, 0]
-                sigma_next = (1 - at_next).sqrt()[0, 0, 0, 0] / at_next.sqrt()[0, 0, 0, 0]
-                xt_mod = xt / at.sqrt()[0, 0, 0, 0]
-                V_t_x = H_funcs.Vt(xt_mod)
-                SVt_x = (V_t_x * Sigma)[:, :U_t_y.shape[1]]
-                V_t_x0 = H_funcs.Vt(x0_t)
-                SVt_x0 = (V_t_x0 * Sigma)[:, :U_t_y.shape[1]]
-
-                falses = torch.zeros(V_t_x0.shape[1] - singulars.shape[0], dtype=torch.bool, device=xt.device)
-                cond_before_lite = singulars * sigma_next > sigma_0
-                cond_after_lite = singulars * sigma_next < sigma_0
-                cond_before = torch.hstack((cond_before_lite, falses))
-                cond_after = torch.hstack((cond_after_lite, falses))
-
-                std_nextC = sigma_next * etaC
-                sigma_tilde_nextC = torch.sqrt(sigma_next ** 2 - std_nextC ** 2)
-
-                std_nextA = sigma_next * etaA
-                sigma_tilde_nextA = torch.sqrt(sigma_next**2 - std_nextA**2)
-                
-                diff_sigma_t_nextB = torch.sqrt(sigma_next ** 2 - sigma_0 ** 2 / singulars[cond_before_lite] ** 2 * (etaB ** 2))
-
-                Vt_xt_mod_next = V_t_x0 + sigma_tilde_nextC * H_funcs.Vt(et) + std_nextC * torch.randn_like(V_t_x0)
-
-                Vt_xt_mod_next[:, cond_after] = \
-                    V_t_x0[:, cond_after] + sigma_tilde_nextA * ((U_t_y - SVt_x0) / sigma_0)[:, cond_after_lite] + std_nextA * torch.randn_like(V_t_x0[:, cond_after])
-                
-                Vt_xt_mod_next[:, cond_before] = \
-                    (Sig_inv_U_t_y[:, cond_before_lite] * etaB + (1 - etaB) * V_t_x0[:, cond_before] + diff_sigma_t_nextB * torch.randn_like(U_t_y)[:, cond_before_lite])
-
-                xt_mod_next = H_funcs.V(Vt_xt_mod_next)
-                xt_next = (at_next.sqrt()[0, 0, 0, 0] * xt_mod_next).view(*x.shape)
-
-                x0_preds.append(x0_t.to('cpu'))
-                xs.append(xt_next.to('cpu'))
-
-        return xs, x0_preds
-    except Exception as e:
-        logger.error(f"Efficient generalized steps error: {str(e)}")
-        raise
+        # Clears isotropic_em temporal state; folder order follows _read_list_file (natural sort).
+        self._iso_prev_gray = None
+        self._iso_prev_linear = None
+        self._iso_prev_svd = None
+        self._iso_prev_slice_align = None
+        paths = _read_list_file(self.list_file, self.root)
+        if not paths:
+            raise ValueError(f"No images found in {self.root}")
+        out: List[_ProcessedSample] = []
+        for i, p in enumerate(paths):
+            self._status(f"Processing {i+1}/{len(paths)}: {p.name} ...")
+            out.append(self._process_path(p, i))
+        return out
