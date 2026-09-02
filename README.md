@@ -6,7 +6,7 @@
 
 1. Download the Finetuned Models
 
-You can download the finetuned models and the examples of DF5T from [the release](https://drive.google.com/drive/folders/19gP4LV_GbyEcaHz3pufhUO5XVK9MFQgm?usp=drive_link). 
+You can download the finetuned models and the examples of DF5T from [the release]([https://drive.google.com/drive/folders/19gP4LV_GbyEcaHz3pufhUO5XVK9MFQgm?usp=drive_link](https://huggingface.co/dumengze/DF5T)). 
 
 
 ```
